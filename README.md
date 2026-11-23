@@ -33,7 +33,7 @@ node scripts/protocol-smoke.mjs --kafka
 node scripts/live-showcase-smoke.mjs
 ```
 
-The final script checks that the walkthrough sees both the amendment and the partial fill through Kafka. To emit a verification trace with a canonical book checkpoint and an event fingerprint, run:
+The final script checks that the walkthrough sees both the amendment and the partial fill through Kafka. To emit the ordered events and canonical book checkpoints as JSON Lines, run:
 
 ```sh
 docker compose exec -T app /app/bin/btc-execution-lab --verify-day --kafka --duration-seconds 60 > kafka-check.jsonl
