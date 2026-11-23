@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>BTC Market Feed</title>
+    <link rel="stylesheet" href="./showcase.css" />
+    <script type="module" src="./showcase.mjs"></script>
+  </head>
+  <body>
+    <main class="showcase">
+      <header>
+        <a id="demoBrand" class="brand" href="/demo">BTC carry</a>
+        <span id="marketSource" class="market-source"
+          >Synthetic BTC · Live Kafka</span
+        >
+        <div class="header-actions">
+          <button id="pauseDemo" disabled>Pause</button>
+          <button id="replayDemo" disabled>Restart</button>
+          <button id="comparePolicies">Compare policies</button>
+          <a href="/">Feed walkthrough</a>
+        </div>
+        <button id="portfolioNext" aria-keyshortcuts="ArrowRight" hidden>
+          Next
+        </button>
+        <button id="portfolioReplay" hidden>Replay</button>
+      </header>
+
+      <section class="execution-status" aria-label="Execution summary">
+        <div class="current-phase" role="status">
+          <h1 id="sceneTitle">Connecting</h1>
+          <span id="sceneDescription"></span>
+        </div>
+        <div class="exposure" id="exposureCard">
+          <span>Unhedged BTC</span>
+          <strong id="residualValue">—</strong>
+        </div>
+      </section>
+
+      <section class="books" aria-label="Both order books">
+        <article
+          class="panel book-panel"
+          aria-label="Spot book and our buy order"
+        >
+          <div class="panel-heading">
+            <h2>
+              <i class="spot-dot"></i>
+              <span id="spotBookTitle">BTC spot · Buy</span>
+            </h2>
+            <strong id="spotStatus">—</strong>
+          </div>
+          <div id="spotBucket" class="bucket"></div>
+          <div
+            id="spotBook"
+            class="book"
+            role="img"
+            aria-label="Spot L3 order book. Horizontal axis is resting volume in BTC. Our order is hatched blue."
+          ></div>
+          <div class="order-summary">
+            <strong id="spotPrice">Waiting to place</strong>
+            <span id="spotFill">0 / 0.100 BTC</span
+            ><span id="spotQueue">—</span>
+          </div>
+          <p class="order-explanation" id="spotExplanation" hidden></p>
+        </article>
+        <article
+          class="panel book-panel"
+          aria-label="Futures book and our sell order"
+        >
+          <div class="panel-heading">
+            <h2>
+              <i class="future-dot"></i>
+              <span id="futureBookTitle">BTC future · Sell</span>
+            </h2>
+            <strong id="futureStatus">—</strong>
+          </div>
+          <div id="futureBucket" class="bucket"></div>
+          <div
+            id="futureBook"
+            class="book"
+            role="img"
+            aria-label="Futures L3 order book. Horizontal axis is resting volume in BTC. Our order is hatched amber."
+          ></div>
+          <div class="order-summary">
+            <strong id="futurePrice">Waiting to place</strong>
+            <span id="futureFill">0 / 0.100 BTC</span
+            ><span id="futureQueue">—</span>
+          </div>
+          <p class="order-explanation" id="futureExplanation" hidden></p>
+        </article>
+      </section>
+
+      <section
+        id="portfolioEvidence"
+        class="portfolio-evidence"
+        aria-label="Hedge decision evidence"
+        hidden
+      >
+        <div>
+          <span id="portfolioLeftLabel"></span>
+          <strong id="portfolioLeftValue"></strong>
+          <span id="portfolioLeftDetail"></span>
+        </div>
+        <div>
+          <span id="portfolioRightLabel"></span>
+          <strong id="portfolioRightValue"></strong>
+          <span id="portfolioRightDetail"></span>
+        </div>
+      </section>
+
+      <div class="market-context">
+        <section class="panel carry-panel" aria-labelledby="carryTitle">
+          <div class="carry-heading">
+            <h2 id="carryTitle">Expected carry at expiry</h2>
+            <span id="carryReason"></span>
+          </div>
+          <table aria-labelledby="carryTitle">
+            <thead>
+              <tr>
+                <th scope="col">Estimate</th>
+                <th scope="col">Gross spread</th>
+                <th scope="col">Fees</th>
+                <th scope="col">Financing</th>
+                <th scope="col">Net carry</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr id="beforeCarry">
+                <th scope="row">If limits fill</th>
+                <td>—</td>
+                <td>—</td>
+                <td>—</td>
+                <td>—</td>
+              </tr>
+              <tr id="afterCarry" hidden>
+                <th scope="row">After hedging</th>
+                <td>—</td>
+                <td>—</td>
+                <td>—</td>
+                <td>—</td>
+              </tr>
+            </tbody>
+          </table>
+          <p id="carryNote">
+            Fees include entry and estimated spot exit. Financing runs to model
+            expiry.
+          </p>
+          <p id="entryAlternatives" hidden></p>
+        </section>
+
+        <section
+          class="price-panel panel"
+          aria-label="Prices and our executions"
+        >
+          <div class="panel-heading">
+            <h2>Prices &amp; executions</h2>
+            <div class="legend">
+              <span class="spot">Spot buy</span
+              ><span class="future">Futures sell</span
+              ><span>○ Placed · ● Filled</span>
+            </div>
+            <time id="sourceClock">—</time>
+          </div>
+          <div
+            id="historyChart"
+            role="img"
+            aria-label="Prices with our order placements and fills"
+          ></div>
+        </section>
+      </div>
+
+      <footer>
+        <dl
+          class="milestones"
+          aria-label="Execution timeline in market seconds"
+        >
+          <div>
+            <dt>Orders placed</dt>
+            <dd id="placedAt">—</dd>
+          </div>
+          <div>
+            <dt>First fill</dt>
+            <dd id="filledAt">—</dd>
+          </div>
+          <div>
+            <dt>Hedge filled</dt>
+            <dd id="hedgedAt">—</dd>
+          </div>
+        </dl>
+        <div class="provenance">
+          <span id="demoPace">½×</span><span id="holdNote">Connecting…</span>
+        </div>
+      </footer>
+      <p id="demoError" role="alert" hidden></p>
+    </main>
+
+    <dialog id="policyComparison" aria-labelledby="comparisonTitle">
+      <div class="comparison-heading">
+        <h2 id="comparisonTitle">Policy comparison</h2>
+        <form method="dialog"><button>Close</button></form>
+      </div>
+      <form id="comparisonForm">
+        <label for="comparisonExperiment">Compare</label>
+        <select id="comparisonExperiment">
+          <option value="entry">Entry</option>
+          <option value="hedge">Hedging</option>
+        </select>
+        <label for="comparisonSeed">Market seed</label>
+        <input
+          id="comparisonSeed"
+          type="number"
+          min="0"
+          max="9007199254740991"
+          step="1"
+          required
+        />
+        <button id="runComparison" type="submit">Run</button>
+      </form>
+      <p id="comparisonStatus" role="status"></p>
+      <p id="queueDifference" hidden></p>
+      <div class="comparison-results" id="comparisonResults" hidden>
+        <table aria-labelledby="comparisonTitle">
+          <thead>
+            <tr>
+              <th scope="col">Policy</th>
+              <th scope="col" id="comparisonEntryColumn" hidden>Entry</th>
+              <th scope="col">Hedged BTC</th>
+              <th scope="col">Open BTC</th>
+              <th scope="col">Exposed time</th>
+              <th scope="col">BTC·s exposed</th>
+              <th scope="col">Crossed BTC</th>
+              <th scope="col">Net carry</th>
+            </tr>
+          </thead>
+          <tbody id="comparisonRows"></tbody>
+        </table>
+      </div>
+      <p id="comparisonNote" hidden>
+        Net carry is projected at expiry for matched BTC. BTC·s weights the time
+        exposed by the size of the open position. Policies can change fills and
+        displayed liquidity.
+      </p>
+      <p id="comparisonMethod" hidden></p>
+      <a id="playComparisonPath" hidden>Open this path in the demo ↗</a>
+    </dialog>
+  </body>
+</html>

@@ -1,0 +1,4 @@
+/target/
+/.preview/
+/node_modules/
+/kafka-check.jsonl
