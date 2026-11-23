@@ -1,6 +1,18 @@
 # BTC Market Feed
 
-A Rust service generates synthetic BTC spot and futures order messages, writes them to Kafka and reads them back for delivery to the browser. The browser applies the messages in sequence and reconstructs both market-by-order (L3) books. An example strategy places simulated orders and shows where they sit in the queues, what fills and what remains open.
+A Rust and Kafka pipeline for market-by-order (L3) data in the browser. It streams synthetic BTC spot and futures order messages and reconstructs each order queue live.
+
+## Live order messages
+
+Follow one resting order as a Kafka message changes its size. A later partial fill updates the book, the strategy’s remaining order and the price chart together.
+
+![Live BTC spot and futures books showing an order amendment and a partial fill](docs/media/live-order-messages.gif)
+
+## Historical order book replay
+
+A separate demo reconstructs historical L3 books from recorded order messages and replays them in the browser.
+
+![Historical L3 order book replay in the browser](docs/media/historical-l3-replay.gif)
 
 ## Run the demo
 
@@ -8,7 +20,7 @@ A Rust service generates synthetic BTC spot and futures order messages, writes t
 docker compose up --build --wait
 ```
 
-Open [the feed walkthrough](http://127.0.0.1:4330/). It pauses on a size amendment to a resting spot order, then shows a partial futures fill and the update to the strategy’s remaining size. [Manual mode](http://127.0.0.1:4330/?manual=1) advances with **Next** or the right arrow. The price charts show placements as open circles and fills as solid circles.
+Open [the feed walkthrough](http://127.0.0.1:4330/). In [manual mode](http://127.0.0.1:4330/?manual=1), use **Next** or the right arrow to step through the events. Open circles on the price chart mark order placement. Solid circles mark fills.
 
 [The full demo](http://127.0.0.1:4330/?view=full) lets you compare entry and hedge rules using L3 order identities or L2 aggregate depth. Both modes use synthetic data and simulated executions.
 
