@@ -208,10 +208,13 @@ impl Book {
                 if self.orders.contains_key(&order.id) {
                     return Err(format!("Duplicate order id {}.", order.id));
                 }
-                if self.best(order.side.opposite()).is_some_and(|best| match order.side {
-                    Side::Buy => order.price_cents >= best,
-                    Side::Sell => order.price_cents <= best,
-                }) {
+                if self
+                    .best(order.side.opposite())
+                    .is_some_and(|best| match order.side {
+                        Side::Buy => order.price_cents >= best,
+                        Side::Sell => order.price_cents <= best,
+                    })
+                {
                     return Err("Added order would cross the opposite book.".into());
                 }
                 self.side_book_mut(order.side)
@@ -239,7 +242,9 @@ impl Book {
                 if *lots == order.lots {
                     // Check both indexes before changing either one. A malformed event
                     // must not leave the order map and price-level map out of sync.
-                    let position = self.side_book(side).levels
+                    let position = self
+                        .side_book(side)
+                        .levels
                         .get(&price)
                         .ok_or_else(|| "Order has no price level.".to_string())?
                         .iter()
@@ -475,7 +480,10 @@ mod tests {
     #[test]
     fn malformed_full_reduction_does_not_mutate_order_index() {
         let mut book = Book::default();
-        book.apply(&BookEvent::Add { order: order(1, Side::Buy, 10_000, 2) }).unwrap();
+        book.apply(&BookEvent::Add {
+            order: order(1, Side::Buy, 10_000, 2),
+        })
+        .unwrap();
         book.buys.levels.get_mut(&10_000).unwrap().clear();
         assert!(book.apply(&BookEvent::Reduce { id: 1, lots: 2 }).is_err());
         assert_eq!(book.get(1).unwrap().lots, 2);
@@ -484,8 +492,16 @@ mod tests {
     #[test]
     fn added_order_cannot_cross_book() {
         let mut book = Book::default();
-        book.apply(&BookEvent::Add { order: order(1, Side::Sell, 10_100, 2) }).unwrap();
-        assert!(book.apply(&BookEvent::Add { order: order(2, Side::Buy, 10_100, 1) }).is_err());
+        book.apply(&BookEvent::Add {
+            order: order(1, Side::Sell, 10_100, 2),
+        })
+        .unwrap();
+        assert!(
+            book.apply(&BookEvent::Add {
+                order: order(2, Side::Buy, 10_100, 1)
+            })
+            .is_err()
+        );
         assert!(book.get(2).is_none());
     }
 

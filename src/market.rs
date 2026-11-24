@@ -287,10 +287,13 @@ impl Session {
                 let target = (self.elapsed_ms + u64::from(milliseconds)).min(DAY);
                 while working.next_event_ms <= target {
                     let scheduled = working.next_event_ms;
-                    working.next_event_ms = scheduled + match working.market_path {
-                        Some(path) => queue_market::arrival_interval(working.seed, path.arrivals + 1),
-                        None => 70 + working.random(61),
-                    };
+                    working.next_event_ms = scheduled
+                        + match working.market_path {
+                            Some(path) => {
+                                queue_market::arrival_interval(working.seed, path.arrivals + 1)
+                            }
+                            None => 70 + working.random(61),
+                        };
                     working.elapsed_ms = scheduled;
                     // Commit the next arrival before doing work so request boundaries
                     // never change the stream or expose an event from the future.
@@ -381,7 +384,12 @@ impl Session {
                 let executed = working.own[&id].filled_lots;
                 if executed < lots {
                     // The IOC never added a public resting order to remove.
-                    working.emit(Message::Cancelled { order_id: id.to_string() }, &mut out)?;
+                    working.emit(
+                        Message::Cancelled {
+                            order_id: id.to_string(),
+                        },
+                        &mut out,
+                    )?;
                 }
                 if executed > 0 {
                     working.submit_owned(rest_market, executed, rest_price, &mut out)?;
@@ -396,23 +404,51 @@ impl Session {
                 let mut residual: i64 = 0;
                 for order in self.own.values() {
                     residual += i64::from(order.filled_lots)
-                        * if order.market == MarketId::Spot { 1 } else { -1 };
+                        * if order.market == MarketId::Spot {
+                            1
+                        } else {
+                            -1
+                        };
                 }
                 if residual != 0 && self.own.len() >= MAX_OWN_ORDERS {
                     return Err("Session order limit reached.".into());
                 }
                 // Cancel both unfilled entry remainders before sizing the hedge.
                 // Planning is atomic: another market step cannot add exposure in between.
-                let active: Vec<u64> = self.own.iter()
+                let active: Vec<u64> = self
+                    .own
+                    .iter()
                     .filter(|(_, order)| matches!(order.status.as_str(), "working" | "partial"))
-                    .map(|(id, _)| *id).collect();
-                for id in active { working.cancel_owned(id, &mut out)?; }
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in active {
+                    working.cancel_owned(id, &mut out)?;
+                }
                 if residual != 0 {
-                    let market = if residual > 0 { MarketId::Future } else { MarketId::Spot };
-                    let opposite = if market == MarketId::Spot { Side::Sell } else { Side::Buy };
-                    let best = working.books[market.index()].best(opposite).ok_or("No opposing liquidity.")?;
-                    let limit = if market == MarketId::Spot { best + 10_000 } else { best - 10_000 };
-                    working.submit_owned(market, residual.unsigned_abs() as u32, limit, &mut out)?;
+                    let market = if residual > 0 {
+                        MarketId::Future
+                    } else {
+                        MarketId::Spot
+                    };
+                    let opposite = if market == MarketId::Spot {
+                        Side::Sell
+                    } else {
+                        Side::Buy
+                    };
+                    let best = working.books[market.index()]
+                        .best(opposite)
+                        .ok_or("No opposing liquidity.")?;
+                    let limit = if market == MarketId::Spot {
+                        best + 10_000
+                    } else {
+                        best - 10_000
+                    };
+                    working.submit_owned(
+                        market,
+                        residual.unsigned_abs() as u32,
+                        limit,
+                        &mut out,
+                    )?;
                 }
             }
             Command::Cross(id) => {
@@ -766,27 +802,59 @@ impl Session {
         let spot_move = self.random(51) as i64 - 25;
         let basis_move = self.random(81) as i64 - 40;
         self.fair_cents = (self.fair_cents + spot_move).clamp(8_000_000, 12_000_000);
-        self.basis_cents = (self.basis_cents + basis_move
-            + (80_000 - self.basis_cents) / 1_000).clamp(-200_000, 300_000);
+        self.basis_cents = (self.basis_cents + basis_move + (80_000 - self.basis_cents) / 1_000)
+            .clamp(-200_000, 300_000);
         let market = MarketId::BOTH[self.random(2) as usize];
         self.market_micro_tick(market, out)?;
-        let mid = self.fair_cents + if market == MarketId::Future { self.basis_cents } else { 0 };
+        let mid = self.fair_cents
+            + if market == MarketId::Future {
+                self.basis_cents
+            } else {
+                0
+            };
         let anchor = ((mid + TICK / 2) / TICK) * TICK;
         for side in [Side::Buy, Side::Sell] {
-            let touch = if side == Side::Buy { anchor - TICK } else { anchor + TICK };
+            let touch = if side == Side::Buy {
+                anchor - TICK
+            } else {
+                anchor + TICK
+            };
             let levels = self.books[market.index()].levels(side);
             let displaced = levels.iter().find_map(|(price, orders)| {
-                let depth = if side == Side::Buy { touch - *price } else { *price - touch };
-                if (0..32 * TICK).contains(&depth) { return None; }
-                orders.iter().find(|order| !self.own.contains_key(&order.id)).map(|order| order.id)
+                let depth = if side == Side::Buy {
+                    touch - *price
+                } else {
+                    *price - touch
+                };
+                if (0..32 * TICK).contains(&depth) {
+                    return None;
+                }
+                orders
+                    .iter()
+                    .find(|order| !self.own.contains_key(&order.id))
+                    .map(|order| order.id)
             });
             if let Some(id) = displaced {
                 let change = self.books[market.index()].cancel(id)?;
-                self.emit(Message::Book { market, change, cause: "cancel".into() }, out)?;
+                self.emit(
+                    Message::Book {
+                        market,
+                        change,
+                        cause: "cancel".into(),
+                    },
+                    out,
+                )?;
             }
-            let depth = if self.random(3) == 0 { self.random(32) } else { self.random(6) };
-            let price = if side == Side::Buy { touch - depth as i64 * TICK }
-                else { touch + depth as i64 * TICK };
+            let depth = if self.random(3) == 0 {
+                self.random(32)
+            } else {
+                self.random(6)
+            };
+            let price = if side == Side::Buy {
+                touch - depth as i64 * TICK
+            } else {
+                touch + depth as i64 * TICK
+            };
             let book = &self.books[market.index()];
             let price = match (side, book.best(side.opposite())) {
                 (Side::Buy, Some(ask)) => price.min(ask - TICK),
@@ -795,19 +863,48 @@ impl Session {
             };
             if book.at_price(side, price).len() < 3 {
                 let lots = 10 + self.random(30) as u32;
-                self.submit(market, Order { id: self.next_id, side, price_cents: price, lots }, out)?;
+                self.submit(
+                    market,
+                    Order {
+                        id: self.next_id,
+                        side,
+                        price_cents: price,
+                        lots,
+                    },
+                    out,
+                )?;
             }
         }
         // Independent, finite taker flow occasionally consumes the touch queue.
         if self.random(4) == 0 {
-            let side = if self.random(2) == 0 { Side::Buy } else { Side::Sell };
+            let side = if self.random(2) == 0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
             if let Some(price_cents) = self.books[market.index()].best(side.opposite()) {
                 let lots = 40 + self.random(161) as u32;
                 let id = self.next_id;
-                self.submit(market, Order { id, side, price_cents, lots }, out)?;
+                self.submit(
+                    market,
+                    Order {
+                        id,
+                        side,
+                        price_cents,
+                        lots,
+                    },
+                    out,
+                )?;
                 if self.books[market.index()].get(id).is_some() {
                     let change = self.books[market.index()].cancel(id)?;
-                    self.emit(Message::Book { market, change, cause: "cancel".into() }, out)?;
+                    self.emit(
+                        Message::Book {
+                            market,
+                            change,
+                            cause: "cancel".into(),
+                        },
+                        out,
+                    )?;
                 }
             }
         }
@@ -823,12 +920,14 @@ impl Session {
         self.fair_cents = (self.fair_cents + noise * scale + pull).clamp(8_000_000, 12_000_000);
         // A seeded mean-reverting basis process centered near 30 days of 8% simple financing.
         // This is an illustrative process, not a fitted venue model.
-        let financing_basis = (self.fair_cents as f64 * FINANCING_RATE * 30.0 / 365.0).round() as i64;
+        let financing_basis =
+            (self.fair_cents as f64 * FINANCING_RATE * 30.0 / 365.0).round() as i64;
         // A slow basis factor, separate from spot: at most $5 innovation per
         // one-second reference update, with an illustrative one-hour pullback.
         let basis_noise = self.random(1_001) as i64 - 500;
-        self.basis_cents = (self.basis_cents + (financing_basis - self.basis_cents) / 3_600 + basis_noise)
-            .clamp(-200_000, 300_000);
+        self.basis_cents =
+            (self.basis_cents + (financing_basis - self.basis_cents) / 3_600 + basis_noise)
+                .clamp(-200_000, 300_000);
         self.replenish(out)?;
         for market in MarketId::BOTH {
             // Regular aggressive flow consumes real FIFO queues, including the trader's orders.
@@ -1101,14 +1200,7 @@ impl Session {
                 } else {
                     self.feed_stats[index].adds += 1;
                 }
-                self.push_visual(
-                    at_ms,
-                    market,
-                    "add",
-                    order,
-                    None,
-                    None,
-                );
+                self.push_visual(at_ms, market, "add", order, None, None);
                 return;
             }
             BookEvent::Amend {
@@ -1164,14 +1256,7 @@ impl Session {
                 lots,
                 ..order.clone()
             };
-            self.push_visual(
-                at_ms,
-                market,
-                kind,
-                &visual_order,
-                Some(order.lots),
-                None,
-            );
+            self.push_visual(at_ms, market, kind, &visual_order, Some(order.lots), None);
         }
     }
 
@@ -1223,12 +1308,18 @@ impl Session {
         let hedged_lots = quantities[0].min(quantities[1]);
         let (mut matched_basis, mut matched_entry_fees, mut financing, mut exit_fees) =
             (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
-        let mut spot_queue: VecDeque<(&OwnFill, u32)> = self.fills.iter()
+        let mut spot_queue: VecDeque<(&OwnFill, u32)> = self
+            .fills
+            .iter()
             .filter(|fill| fill.market == MarketId::Spot)
-            .map(|fill| (fill, fill.lots)).collect();
-        let mut future_queue: VecDeque<(&OwnFill, u32)> = self.fills.iter()
+            .map(|fill| (fill, fill.lots))
+            .collect();
+        let mut future_queue: VecDeque<(&OwnFill, u32)> = self
+            .fills
+            .iter()
             .filter(|fill| fill.market == MarketId::Future)
-            .map(|fill| (fill, fill.lots)).collect();
+            .map(|fill| (fill, fill.lots))
+            .collect();
         while let (Some((spot, spot_left)), Some((future, future_left))) =
             (spot_queue.front().copied(), future_queue.front().copied())
         {
@@ -1238,16 +1329,23 @@ impl Session {
             matched_entry_fees += spot.fee_cents as f64 * f64::from(lots) / f64::from(spot.lots)
                 + future.fee_cents as f64 * f64::from(lots) / f64::from(future.lots);
             let remaining_ms = EXPIRY_MS.saturating_sub(spot.clock_ms);
-            financing += spot.price_cents as f64 * quantity * FINANCING_RATE
-                * remaining_ms as f64 / (365.0 * DAY as f64);
+            financing += spot.price_cents as f64 * quantity * FINANCING_RATE * remaining_ms as f64
+                / (365.0 * DAY as f64);
             let spot_mid = self.books[0].best(Side::Buy).unwrap_or(spot.price_cents)
                 + (self.books[0].best(Side::Sell).unwrap_or(spot.price_cents)
-                    - self.books[0].best(Side::Buy).unwrap_or(spot.price_cents)) / 2;
+                    - self.books[0].best(Side::Buy).unwrap_or(spot.price_cents))
+                    / 2;
             exit_fees += spot_mid as f64 * quantity * SPOT_EXIT_FEE_BPS / 10_000.0;
-            if lots == spot_left { spot_queue.pop_front(); }
-            else { *spot_queue.front_mut().unwrap() = (spot, spot_left - lots); }
-            if lots == future_left { future_queue.pop_front(); }
-            else { *future_queue.front_mut().unwrap() = (future, future_left - lots); }
+            if lots == spot_left {
+                spot_queue.pop_front();
+            } else {
+                *spot_queue.front_mut().unwrap() = (spot, spot_left - lots);
+            }
+            if lots == future_left {
+                future_queue.pop_front();
+            } else {
+                *future_queue.front_mut().unwrap() = (future, future_left - lots);
+            }
         }
         let round = |value: f64| value.round() as i64;
         let basis_cents = round(matched_basis);
@@ -1257,8 +1355,12 @@ impl Session {
         let projected = if hedged_lots > 0 {
             // Net rounds once from full-precision components; separately reported
             // components are rounded only for display and need not add to this value.
-            Some(round(matched_basis - matched_entry_fees - financing - exit_fees))
-        } else { None };
+            Some(round(
+                matched_basis - matched_entry_fees - financing - exit_fees,
+            ))
+        } else {
+            None
+        };
         let mut current_mid_mark = -(fees.iter().sum::<i64>() as f64);
         for fill in &self.fills {
             let book = &self.books[fill.market.index()];
@@ -1271,7 +1373,10 @@ impl Session {
             };
             current_mid_mark += move_cents as f64 * f64::from(fill.lots) / LOTS_PER_BTC;
         }
-        let indicated = match (self.books[0].best(Side::Sell), self.books[1].best(Side::Buy)) {
+        let indicated = match (
+            self.books[0].best(Side::Sell),
+            self.books[1].best(Side::Buy),
+        ) {
             (Some(spot_ask), Some(future_bid)) => Some(future_bid - spot_ask),
             _ => None,
         };
@@ -1381,19 +1486,44 @@ mod tests {
         let mut session = Session::new(1);
         for (market, mid) in [(MarketId::Spot, spot_mid), (MarketId::Future, future_mid)] {
             let book = &mut session.books[market.index()];
-            book.apply(&BookEvent::Add { order: Order {
-                id: 1, side: Side::Buy, price_cents: mid - 50, lots: 1,
-            }}).unwrap();
-            book.apply(&BookEvent::Add { order: Order {
-                id: 2, side: Side::Sell, price_cents: mid + 50, lots: 1,
-            }}).unwrap();
+            book.apply(&BookEvent::Add {
+                order: Order {
+                    id: 1,
+                    side: Side::Buy,
+                    price_cents: mid - 50,
+                    lots: 1,
+                },
+            })
+            .unwrap();
+            book.apply(&BookEvent::Add {
+                order: Order {
+                    id: 2,
+                    side: Side::Sell,
+                    price_cents: mid + 50,
+                    lots: 1,
+                },
+            })
+            .unwrap();
         }
         session
     }
 
-    fn test_fill(market: MarketId, side: Side, lots: u32, price_cents: i64, fee_cents: i64, clock_ms: u64) -> OwnFill {
+    fn test_fill(
+        market: MarketId,
+        side: Side,
+        lots: u32,
+        price_cents: i64,
+        fee_cents: i64,
+        clock_ms: u64,
+    ) -> OwnFill {
         OwnFill {
-            order_id: "test".into(), market, side, lots, price_cents, fee_cents, clock_ms,
+            order_id: "test".into(),
+            market,
+            side,
+            lots,
+            price_cents,
+            fee_cents,
+            clock_ms,
             liquidity: "maker".into(),
         }
     }
@@ -1402,7 +1532,9 @@ mod tests {
     fn reference_repricing_does_not_trade_against_our_resting_order() {
         let mut session = init(41);
         let mut events = Vec::new();
-        session.submit_owned(MarketId::Spot, 100_000, 9_950_000, &mut events).unwrap();
+        session
+            .submit_owned(MarketId::Spot, 100_000, 9_950_000, &mut events)
+            .unwrap();
         let id = session.next_id - 1;
         assert_eq!(session.own[&id].filled_lots, 0);
 
@@ -1412,8 +1544,15 @@ mod tests {
         session.clock_ms = 1_000;
         session.replenish(&mut events).unwrap();
         assert_eq!(session.own[&id].filled_lots, 0);
-        assert_eq!(session.books[MarketId::Spot.index()].get(id).unwrap().lots, 100_000);
-        assert!(!events.iter().any(|event| matches!(&event.message, Message::Fill { .. })));
+        assert_eq!(
+            session.books[MarketId::Spot.index()].get(id).unwrap().lots,
+            100_000
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(&event.message, Message::Fill { .. }))
+        );
     }
 
     #[test]
@@ -1488,9 +1627,12 @@ mod tests {
             chunks.apply(batch.clone()).unwrap();
             chunked_events.extend(batch);
         }
-        let market_events = |events: Vec<Event>| events.into_iter()
-            .filter(|event| !matches!(&event.message, Message::Tick { .. }))
-            .collect::<Vec<_>>();
+        let market_events = |events: Vec<Event>| {
+            events
+                .into_iter()
+                .filter(|event| !matches!(&event.message, Message::Tick { .. }))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(market_events(whole), market_events(chunked_events));
         assert_eq!(one_batch.snapshot(), chunks.snapshot());
     }
@@ -1568,25 +1710,46 @@ mod tests {
                 .iter()
                 .map(|order| order.lots)
                 .sum();
-            let mut prices = [session.books[0].best(Side::Buy).unwrap(),
-                session.books[1].best(Side::Sell).unwrap()];
+            let mut prices = [
+                session.books[0].best(Side::Buy).unwrap(),
+                session.books[1].best(Side::Sell).unwrap(),
+            ];
             prices[market.index()] = touch;
-            let events = session.plan(Command::Enter {
-                lots: available + 1,
-                spot_limit_cents: prices[0],
-                future_limit_cents: prices[1],
-                cross_market: market,
-            }).unwrap();
+            let events = session
+                .plan(Command::Enter {
+                    lots: available + 1,
+                    spot_limit_cents: prices[0],
+                    future_limit_cents: prices[1],
+                    cross_market: market,
+                })
+                .unwrap();
             session.apply(events).unwrap();
-            let crossed = session.own.values().find(|order| order.market == market).unwrap();
+            let crossed = session
+                .own
+                .values()
+                .find(|order| order.market == market)
+                .unwrap();
             assert_eq!(crossed.filled_lots, available);
             assert_eq!(crossed.status, "cancelled");
-            assert!(session.books[market.index()].get(crossed.id.parse().unwrap()).is_none());
-            let companion = session.own.values().find(|order| order.market == market.other()).unwrap();
+            assert!(
+                session.books[market.index()]
+                    .get(crossed.id.parse().unwrap())
+                    .is_none()
+            );
+            let companion = session
+                .own
+                .values()
+                .find(|order| order.market == market.other())
+                .unwrap();
             assert_eq!(companion.lots, available);
             assert_eq!(companion.filled_lots, 0);
             assert_eq!(companion.status, "working");
-            assert!(session.fills.iter().all(|fill| fill.market == market && fill.liquidity == "taker"));
+            assert!(
+                session
+                    .fills
+                    .iter()
+                    .all(|fill| fill.market == market && fill.liquidity == "taker")
+            );
         }
     }
 
@@ -1597,23 +1760,39 @@ mod tests {
         let future_ask = session.books[1].best(Side::Sell).unwrap();
         let future_bid = session.books[1].best(Side::Buy).unwrap();
         let before = session.snapshot();
-        assert!(session.plan(Command::Enter {
-            lots: 100, spot_limit_cents: spot_bid, future_limit_cents: future_bid,
-            cross_market: MarketId::Spot,
-        }).is_err());
+        assert!(
+            session
+                .plan(Command::Enter {
+                    lots: 100,
+                    spot_limit_cents: spot_bid,
+                    future_limit_cents: future_bid,
+                    cross_market: MarketId::Spot,
+                })
+                .is_err()
+        );
         assert_eq!(session.snapshot(), before);
-        let events = session.plan(Command::Enter {
-            lots: 100, spot_limit_cents: spot_bid, future_limit_cents: future_ask,
-            cross_market: MarketId::Spot,
-        }).unwrap();
+        let events = session
+            .plan(Command::Enter {
+                lots: 100,
+                spot_limit_cents: spot_bid,
+                future_limit_cents: future_ask,
+                cross_market: MarketId::Spot,
+            })
+            .unwrap();
         session.apply(events).unwrap();
         assert_eq!(session.own.len(), 1);
         assert_eq!(session.own.values().next().unwrap().status, "cancelled");
         assert!(session.fills.is_empty());
         let after = session.snapshot();
         for index in 0..2 {
-            assert_eq!(after["books"][index]["bids"], before["books"][index]["bids"]);
-            assert_eq!(after["books"][index]["asks"], before["books"][index]["asks"]);
+            assert_eq!(
+                after["books"][index]["bids"],
+                before["books"][index]["bids"]
+            );
+            assert_eq!(
+                after["books"][index]["asks"],
+                before["books"][index]["asks"]
+            );
         }
     }
 
@@ -1624,16 +1803,29 @@ mod tests {
         let ask = session.books[0].best(Side::Sell).unwrap();
         let bid = session.books[0].best(Side::Buy).unwrap();
         let future_ask = session.books[1].best(Side::Sell).unwrap();
-        session.submit_owned(MarketId::Spot, 37, ask, &mut events).unwrap();
-        session.submit_owned(MarketId::Spot, 63, bid - 1000, &mut events).unwrap();
-        session.submit_owned(MarketId::Future, 100, future_ask + 1000, &mut events).unwrap();
+        session
+            .submit_owned(MarketId::Spot, 37, ask, &mut events)
+            .unwrap();
+        session
+            .submit_owned(MarketId::Spot, 63, bid - 1000, &mut events)
+            .unwrap();
+        session
+            .submit_owned(MarketId::Future, 100, future_ask + 1000, &mut events)
+            .unwrap();
         assert_eq!(session.metrics()["residual_btc"], 0.037);
-        session.apply(session.plan(Command::Hedge).unwrap()).unwrap();
+        session
+            .apply(session.plan(Command::Hedge).unwrap())
+            .unwrap();
         assert_eq!(session.metrics()["spot_btc"], 0.037);
         assert_eq!(session.metrics()["future_short_btc"], 0.037);
         assert_eq!(session.metrics()["residual_btc"], 0.0);
         assert_eq!(session.own.values().last().unwrap().lots, 37);
-        assert!(session.own.values().all(|order| !matches!(order.status.as_str(), "working" | "partial")));
+        assert!(
+            session
+                .own
+                .values()
+                .all(|order| !matches!(order.status.as_str(), "working" | "partial"))
+        );
     }
 
     #[test]
@@ -1642,14 +1834,22 @@ mod tests {
         let mut events = Vec::new();
         let future_bid = session.books[1].best(Side::Buy).unwrap();
         let spot_bid = session.books[0].best(Side::Buy).unwrap();
-        session.submit_owned(MarketId::Future, 37, future_bid, &mut events).unwrap();
-        session.submit_owned(MarketId::Spot, 100, spot_bid - 1000, &mut events).unwrap();
+        session
+            .submit_owned(MarketId::Future, 37, future_bid, &mut events)
+            .unwrap();
+        session
+            .submit_owned(MarketId::Spot, 100, spot_bid - 1000, &mut events)
+            .unwrap();
         assert_eq!(session.metrics()["residual_btc"], -0.037);
-        session.apply(session.plan(Command::Hedge).unwrap()).unwrap();
+        session
+            .apply(session.plan(Command::Hedge).unwrap())
+            .unwrap();
         assert_eq!(session.metrics()["hedged_btc"], 0.037);
         assert_eq!(session.metrics()["residual_btc"], 0.0);
         let count = session.own.len();
-        session.apply(session.plan(Command::Hedge).unwrap()).unwrap();
+        session
+            .apply(session.plan(Command::Hedge).unwrap())
+            .unwrap();
         assert_eq!(session.own.len(), count);
     }
 

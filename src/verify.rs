@@ -56,7 +56,13 @@ async fn commit<W: Write>(
         planned
     };
     for event in &events {
-        line(output, &EventRow { kind: "event", event })?;
+        line(
+            output,
+            &EventRow {
+                kind: "event",
+                event,
+            },
+        )?;
     }
     *event_count += events.len() as u64;
     session.apply(events)
@@ -73,16 +79,27 @@ pub async fn run<W: Write>(
         return Err("Verification duration must be 5000..=86400000 ms".into());
     }
     let kafka = if let Some(broker) = broker {
-        Some(KafkaRun::new(broker, 73).await.map_err(|error| format!("Kafka setup: {error}"))?)
+        Some(
+            KafkaRun::new(broker, 73)
+                .await
+                .map_err(|error| format!("Kafka setup: {error}"))?,
+        )
     } else {
         None
     };
-    let topics = kafka.as_ref().map(|run| json!({"market":run.market_topic,"private":run.private_topic}));
+    let topics = kafka
+        .as_ref()
+        .map(|run| json!({"market":run.market_topic,"private":run.private_topic}));
     let result = run_inner(output, kafka.as_ref(), duration_ms).await;
-    let cleanup = if let Some(run) = &kafka { run.cleanup_topics().await } else { Ok(()) };
+    let cleanup = if let Some(run) = &kafka {
+        run.cleanup_topics().await
+    } else {
+        Ok(())
+    };
     match (result, cleanup) {
-        (Ok((final_snapshot, event_count, initialization_event_count, timings)), Ok(())) => {
-            line(output, &json!({
+        (Ok((final_snapshot, event_count, initialization_event_count, timings)), Ok(())) => line(
+            output,
+            &json!({
                 "type":"summary",
                 "transport":if kafka.is_some(){"kafka"}else{"local"},
                 "topics":topics,
@@ -92,8 +109,8 @@ pub async fn run<W: Write>(
                 "initialization_event_count":initialization_event_count,
                 "kafka_timings":timings,
                 "final_snapshot":final_snapshot
-            }))
-        }
+            }),
+        ),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(format!("Kafka topic cleanup: {error}")),
         (Err(error), Err(cleanup)) => Err(format!("{error}; Kafka topic cleanup: {cleanup}")),
@@ -124,60 +141,160 @@ async fn run_inner<W: Write>(
     let initialization_event_count = initial.len() as u64;
     event_count += initialization_event_count;
     session.apply(initial)?;
-    line(output, &json!({"type":"initial", "snapshot":session.snapshot()}))?;
+    line(
+        output,
+        &json!({"type":"initial", "snapshot":session.snapshot()}),
+    )?;
 
     // Deterministic own-order lifecycle: passive paired orders, cancellations,
     // a spot-only cross and an explicit residual checkpoint, then the hedge cross.
-    commit(&mut session, kafka, output, Command::AdvanceMillis(1_000), &mut event_count, &mut timings).await?;
+    commit(
+        &mut session,
+        kafka,
+        output,
+        Command::AdvanceMillis(1_000),
+        &mut event_count,
+        &mut timings,
+    )
+    .await?;
     let snapshot = session.snapshot();
-    let spot_bid = snapshot["books"][0]["bid_cents"].as_i64().ok_or("Missing spot bid")?;
-    let future_ask = snapshot["books"][1]["ask_cents"].as_i64().ok_or("Missing future ask")?;
-    commit(&mut session, kafka, output, Command::Place {
-        lots: 100, spot_limit_cents: spot_bid, future_limit_cents: future_ask,
-    }, &mut event_count, &mut timings).await?;
-    let first_ids: Vec<u64> = session.snapshot()["orders"].as_array().ok_or("Missing orders")?
-        .iter().map(|order| order["id"].as_str().and_then(|id| id.parse().ok()).ok_or("Invalid own order ID"))
+    let spot_bid = snapshot["books"][0]["bid_cents"]
+        .as_i64()
+        .ok_or("Missing spot bid")?;
+    let future_ask = snapshot["books"][1]["ask_cents"]
+        .as_i64()
+        .ok_or("Missing future ask")?;
+    commit(
+        &mut session,
+        kafka,
+        output,
+        Command::Place {
+            lots: 100,
+            spot_limit_cents: spot_bid,
+            future_limit_cents: future_ask,
+        },
+        &mut event_count,
+        &mut timings,
+    )
+    .await?;
+    let first_ids: Vec<u64> = session.snapshot()["orders"]
+        .as_array()
+        .ok_or("Missing orders")?
+        .iter()
+        .map(|order| {
+            order["id"]
+                .as_str()
+                .and_then(|id| id.parse().ok())
+                .ok_or("Invalid own order ID")
+        })
         .collect::<Result<_, _>>()?;
     for id in first_ids {
-        commit(&mut session, kafka, output, Command::Cancel(id), &mut event_count, &mut timings).await?;
+        commit(
+            &mut session,
+            kafka,
+            output,
+            Command::Cancel(id),
+            &mut event_count,
+            &mut timings,
+        )
+        .await?;
     }
     let snapshot = session.snapshot();
-    let spot_bid = snapshot["books"][0]["bid_cents"].as_i64().ok_or("Missing spot bid")?;
-    let future_ask = snapshot["books"][1]["ask_cents"].as_i64().ok_or("Missing future ask")?;
-    commit(&mut session, kafka, output, Command::Place {
-        lots: 100, spot_limit_cents: spot_bid, future_limit_cents: future_ask,
-    }, &mut event_count, &mut timings).await?;
-    let active_ids: Vec<(u64, MarketId)> = session.snapshot()["orders"].as_array().ok_or("Missing orders")?
-        .iter().filter(|order| matches!(order["status"].as_str(), Some("working" | "partial")))
+    let spot_bid = snapshot["books"][0]["bid_cents"]
+        .as_i64()
+        .ok_or("Missing spot bid")?;
+    let future_ask = snapshot["books"][1]["ask_cents"]
+        .as_i64()
+        .ok_or("Missing future ask")?;
+    commit(
+        &mut session,
+        kafka,
+        output,
+        Command::Place {
+            lots: 100,
+            spot_limit_cents: spot_bid,
+            future_limit_cents: future_ask,
+        },
+        &mut event_count,
+        &mut timings,
+    )
+    .await?;
+    let active_ids: Vec<(u64, MarketId)> = session.snapshot()["orders"]
+        .as_array()
+        .ok_or("Missing orders")?
+        .iter()
+        .filter(|order| matches!(order["status"].as_str(), Some("working" | "partial")))
         .map(|order| {
-            let id = order["id"].as_str().and_then(|id| id.parse().ok()).ok_or("Invalid own order ID")?;
+            let id = order["id"]
+                .as_str()
+                .and_then(|id| id.parse().ok())
+                .ok_or("Invalid own order ID")?;
             let market = match order["market"].as_str() {
                 Some("spot") => MarketId::Spot,
                 Some("future") => MarketId::Future,
                 _ => return Err("Invalid own order market"),
             };
             Ok((id, market))
-        }).collect::<Result<_, &str>>()?;
-    let spot_id = active_ids.iter().find(|(_, market)| *market == MarketId::Spot)
-        .map(|entry| entry.0).ok_or("Missing working spot order")?;
-    let future_id = active_ids.iter().find(|(_, market)| *market == MarketId::Future)
-        .map(|entry| entry.0).ok_or("Missing working future order")?;
-    commit(&mut session, kafka, output, Command::Cross(spot_id), &mut event_count, &mut timings).await?;
+        })
+        .collect::<Result<_, &str>>()?;
+    let spot_id = active_ids
+        .iter()
+        .find(|(_, market)| *market == MarketId::Spot)
+        .map(|entry| entry.0)
+        .ok_or("Missing working spot order")?;
+    let future_id = active_ids
+        .iter()
+        .find(|(_, market)| *market == MarketId::Future)
+        .map(|entry| entry.0)
+        .ok_or("Missing working future order")?;
+    commit(
+        &mut session,
+        kafka,
+        output,
+        Command::Cross(spot_id),
+        &mut event_count,
+        &mut timings,
+    )
+    .await?;
     let residual = session.snapshot();
     if residual["metrics"]["residual_btc"].as_f64() != Some(0.1) {
         return Err("Spot leg did not produce the expected positive 0.1 BTC residual".into());
     }
-    line(output, &json!({"type":"checkpoint", "checkpoint_kind":"residual", "clock_ms":residual["clock_ms"], "snapshot":residual}))?;
-    commit(&mut session, kafka, output, Command::Cross(future_id), &mut event_count, &mut timings).await?;
+    line(
+        output,
+        &json!({"type":"checkpoint", "checkpoint_kind":"residual", "clock_ms":residual["clock_ms"], "snapshot":residual}),
+    )?;
+    commit(
+        &mut session,
+        kafka,
+        output,
+        Command::Cross(future_id),
+        &mut event_count,
+        &mut timings,
+    )
+    .await?;
 
-    let mut elapsed_ms = session.snapshot()["elapsed_ms"].as_u64().ok_or("Missing elapsed clock")?;
+    let mut elapsed_ms = session.snapshot()["elapsed_ms"]
+        .as_u64()
+        .ok_or("Missing elapsed clock")?;
     let mut target = HOUR_MS.min(duration_ms);
     while elapsed_ms < duration_ms {
         let step = (target - elapsed_ms).min(u64::from(BATCH_MS));
-        commit(&mut session, kafka, output, Command::AdvanceMillis(step as u32), &mut event_count, &mut timings).await?;
+        commit(
+            &mut session,
+            kafka,
+            output,
+            Command::AdvanceMillis(step as u32),
+            &mut event_count,
+            &mut timings,
+        )
+        .await?;
         elapsed_ms += step;
         if elapsed_ms == target {
-            line(output, &json!({"type":"checkpoint", "checkpoint_kind":if target == duration_ms {"final"} else {"hourly"}, "clock_ms":target, "snapshot":session.snapshot()}))?;
+            line(
+                output,
+                &json!({"type":"checkpoint", "checkpoint_kind":if target == duration_ms {"final"} else {"hourly"}, "clock_ms":target, "snapshot":session.snapshot()}),
+            )?;
             target = (target + HOUR_MS).min(duration_ms);
         }
     }
@@ -185,5 +302,10 @@ async fn run_inner<W: Write>(
     if duration_ms == DAY_MS && final_snapshot["clock_ms"].as_u64() != Some(DAY_MS) {
         return Err("Full-day run did not reach the canonical close".into());
     }
-    Ok((final_snapshot, event_count, initialization_event_count, timings))
+    Ok((
+        final_snapshot,
+        event_count,
+        initialization_event_count,
+        timings,
+    ))
 }
