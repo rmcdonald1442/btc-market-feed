@@ -1,15 +1,35 @@
 name: Checks
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.98'
+          components: rustfmt
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - run: cargo test --locked --jobs 1
+      - run: cargo fmt --all -- --check
       - run: node --test web/*.test.mjs
+  kafka:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: docker compose up --build --wait --wait-timeout 120
+      - run: node scripts/protocol-smoke.mjs --kafka
+      - run: node scripts/live-showcase-smoke.mjs
+      - if: failure()
+        run: docker compose logs --tail 120
+      - if: always()
+        run: docker compose down --volumes

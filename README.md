@@ -4,9 +4,9 @@ A Rust and Kafka pipeline for market-by-order (L3) data in the browser. It strea
 
 ## Live order messages
 
-Follow one resting order as a Kafka message changes its size. A later partial fill updates the book, the strategy’s remaining order and the price chart together.
+Follow one resting order through a size amendment, then watch the example strategy place a spot buy and a futures sell. A partial fill updates the futures book, remaining order size and price chart together.
 
-![Live BTC spot and futures books showing an order amendment and a partial fill](docs/media/live-order-messages.gif)
+![Automatic Kafka demo showing an amendment, two order placements and a partial fill](docs/media/live-order-messages.gif)
 
 ## Historical L3 archive
 
@@ -15,6 +15,8 @@ A separate demo starts with one historical L3 book and expands to 30 books runni
 ![Historical L3 archive showing one book followed by a 30-book benchmark](docs/media/historical-l3-archive.gif)
 
 ## Run the demo
+
+With Docker Engine and the Compose plugin running, enter this from the repository root.
 
 ```sh
 docker compose up --build --wait
@@ -30,22 +32,29 @@ Open [the automatic feed walkthrough](http://127.0.0.1:4330/). It pauses on the 
 Seeded market + FIFO matcher → Kafka → Rust HTTP API → JavaScript event projector → browser
 ```
 
-Each session uses ordered market events and separate acknowledgements and fills. The server reads back the corresponding Kafka records before returning the next HTTP event batch. The browser uses event sequence numbers and source timestamps to apply updates, maintain queues and place markers on the price charts. The API accepts revision numbers so a retried request can recover the same reply without advancing the simulation twice.
+The Rust service sends market updates and strategy execution events to separate Kafka topics. It validates the broker readback and merges the records in sequence before sending each HTTP batch. The browser applies that order to reconstruct FIFO queues and uses source timestamps for the price chart.
 
-The browser advances the market in steps, so the walkthrough can pause at a specific event. This is a local demo with a single broker. Compose binds the web app to loopback and keeps the broker inside the Compose network.
+Each session serialises commands by revision. An identical retry of the most recent accepted command returns its cached reply. If Kafka delivery fails partway through a batch, the session stops at its last accepted revision and needs a restart.
+
+The browser requests each step, so the walkthrough can pause at a specific event. Compose runs one broker on its internal network and publishes the web app on loopback. Normal session close and eviction delete their topics. An interrupted container can leave topics in the broker volume.
 
 ## Verify
 
-With Rust 1.98 and Node.js 22 or later:
+Run the unit tests with Rust 1.98 and Node.js 22 or later.
 
 ```sh
 cargo test --locked --jobs 1
 node --test web/*.test.mjs
+```
+
+With the Compose stack running, check revision handling and the walkthrough’s underlying Kafka event stream.
+
+```sh
 node scripts/protocol-smoke.mjs --kafka
 node scripts/live-showcase-smoke.mjs
 ```
 
-The final script checks that the walkthrough sees both the amendment and the partial fill through Kafka. To emit the ordered events and canonical book checkpoints as JSON Lines, run:
+The second script verifies the amendment, order placement and partial fill in sequence. To emit ordered events and canonical book checkpoints as JSON Lines, run the verifier in the app container.
 
 ```sh
 docker compose exec -T app /app/bin/btc-execution-lab --verify-day --kafka --duration-seconds 60 > kafka-check.jsonl

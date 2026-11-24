@@ -16,6 +16,9 @@ use rskafka::{
 use tokio::sync::Mutex;
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const ADMIN_TIMEOUT_MS: i32 = 5_000;
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(7);
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct DeliveryTimings {
@@ -53,6 +56,16 @@ fn ignore_already_deleted_topic(result: Result<(), KafkaError>) -> Result<(), Ka
     }
 }
 
+async fn delete_topic(controller: &ControllerClient, topic: &str) -> Result<(), String> {
+    let result = tokio::time::timeout(
+        CLEANUP_TIMEOUT,
+        controller.delete_topic(topic, ADMIN_TIMEOUT_MS),
+    )
+    .await
+    .map_err(|_| format!("Delete topic {topic}: timed out"))?;
+    ignore_already_deleted_topic(result).map_err(|error| format!("Delete topic {topic}: {error}"))
+}
+
 pub struct KafkaRun {
     controller: ControllerClient,
     market_partition: PartitionClient,
@@ -67,10 +80,14 @@ pub struct KafkaRun {
 
 impl KafkaRun {
     pub async fn new(broker: &str, run_id: u64) -> Result<Self, String> {
-        let client = ClientBuilder::new(vec![broker.to_owned()])
-            .build()
-            .await
-            .map_err(|e| format!("Kafka connect: {e}"))?;
+        let deadline = tokio::time::Instant::now() + SETUP_TIMEOUT;
+        let client = tokio::time::timeout_at(
+            deadline,
+            ClientBuilder::new(vec![broker.to_owned()]).build(),
+        )
+        .await
+        .map_err(|_| "Kafka connection timed out.".to_owned())?
+        .map_err(|error| format!("Kafka connect: {error}"))?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| format!("System clock: {e}"))?
@@ -82,38 +99,37 @@ impl KafkaRun {
         let admin = client
             .controller_client()
             .map_err(|e| format!("Kafka controller: {e}"))?;
-        if let Err(error) = admin.create_topic(&market_topic, 1, 1, 5_000).await {
-            let _ = admin.delete_topic(&market_topic, 5_000).await;
-            return Err(format!("Create topic {market_topic}: {error}"));
-        }
-        if let Err(error) = admin
-            .create_topic(&private_topic, 1, 1, 5_000)
-            .await
-        {
-            let _ = admin.delete_topic(&market_topic, 5_000).await;
-            let _ = admin.delete_topic(&private_topic, 5_000).await;
-            return Err(format!("Create topic {private_topic}: {error}"));
-        }
-        let market_partition = match client
-            .partition_client(market_topic.clone(), 0, UnknownTopicHandling::Retry)
-            .await
-        {
-            Ok(partition) => partition,
-            Err(error) => {
-                let _ = admin.delete_topic(&market_topic, 5_000).await;
-                let _ = admin.delete_topic(&private_topic, 5_000).await;
-                return Err(format!("Open partition {market_topic}: {error}"));
+        let mut requested = Vec::with_capacity(2);
+        let provisioning = tokio::time::timeout_at(deadline, async {
+            for topic in [&market_topic, &private_topic] {
+                // A request may reach Kafka even if its acknowledgement times out.
+                requested.push(topic);
+                admin
+                    .create_topic(topic, 1, 1, ADMIN_TIMEOUT_MS)
+                    .await
+                    .map_err(|error| format!("Create topic {topic}: {error}"))?;
             }
-        };
-        let private_partition = match client
-            .partition_client(private_topic.clone(), 0, UnknownTopicHandling::Retry)
-            .await
-        {
-            Ok(partition) => partition,
-            Err(error) => {
-                let _ = admin.delete_topic(&market_topic, 5_000).await;
-                let _ = admin.delete_topic(&private_topic, 5_000).await;
-                return Err(format!("Open partition {private_topic}: {error}"));
+            let market = client
+                .partition_client(market_topic.clone(), 0, UnknownTopicHandling::Retry)
+                .await
+                .map_err(|error| format!("Open partition {market_topic}: {error}"))?;
+            let private = client
+                .partition_client(private_topic.clone(), 0, UnknownTopicHandling::Retry)
+                .await
+                .map_err(|error| format!("Open partition {private_topic}: {error}"))?;
+            Ok((market, private))
+        })
+        .await
+        .unwrap_or_else(|_| Err("Kafka topic setup timed out.".to_owned()));
+        let (market_partition, private_partition) = match provisioning {
+            Ok(partitions) => partitions,
+            Err(mut error) => {
+                for topic in requested {
+                    if let Err(cleanup) = delete_topic(&admin, topic).await {
+                        error.push_str(&format!(" Cleanup failed: {cleanup}"));
+                    }
+                }
+                return Err(error);
             }
         };
         Ok(Self {
@@ -130,17 +146,23 @@ impl KafkaRun {
     }
 
     pub async fn cleanup_topics(&self) -> Result<(), String> {
-        if !self.market_deleted.load(Ordering::Acquire) {
-            ignore_already_deleted_topic(self.controller.delete_topic(&self.market_topic, 5_000).await)
-                .map_err(|error| format!("Delete topic {}: {error}", self.market_topic))?;
-            self.market_deleted.store(true, Ordering::Release);
+        let mut errors = Vec::new();
+        for (topic, deleted) in [
+            (&self.market_topic, &self.market_deleted),
+            (&self.private_topic, &self.private_deleted),
+        ] {
+            if !deleted.load(Ordering::Acquire) {
+                match delete_topic(&self.controller, topic).await {
+                    Ok(()) => deleted.store(true, Ordering::Release),
+                    Err(error) => errors.push(error),
+                }
+            }
         }
-        if !self.private_deleted.load(Ordering::Acquire) {
-            ignore_already_deleted_topic(self.controller.delete_topic(&self.private_topic, 5_000).await)
-                .map_err(|error| format!("Delete topic {}: {error}", self.private_topic))?;
-            self.private_deleted.store(true, Ordering::Release);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join(". "))
         }
-        Ok(())
     }
 
     pub async fn deliver_measured(
@@ -264,10 +286,8 @@ async fn publish_chunk_and_read(
             sequences.len()
         ));
     }
-    let mut pending: BTreeMap<i64, u64> = offsets
-        .into_iter()
-        .zip(sequences.iter().copied())
-        .collect();
+    let mut pending: BTreeMap<i64, u64> =
+        offsets.into_iter().zip(sequences.iter().copied()).collect();
     if pending.len() != sequences.len() {
         return Err(format!("Kafka returned duplicate offsets on {topic}"));
     }
@@ -364,10 +384,12 @@ mod tests {
 
     #[test]
     fn topic_cleanup_treats_unknown_topic_as_already_deleted() {
-        assert!(ignore_already_deleted_topic(Err(server_error(
-            ProtocolError::UnknownTopicOrPartition,
-        )))
-        .is_ok());
+        assert!(
+            ignore_already_deleted_topic(Err(
+                server_error(ProtocolError::UnknownTopicOrPartition,)
+            ))
+            .is_ok()
+        );
     }
 
     #[test]

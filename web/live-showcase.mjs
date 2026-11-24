@@ -232,6 +232,9 @@ function entryReceipt(snapshot, events, crossMarket) {
 
 // A single request lane owns revisions. Neither stepping nor commands read a capture.
 export class LiveShowcase {
+  #projector = null;
+  #projectionFailed = false;
+
   constructor({
     base = "/api",
     fetchImpl = globalThis.fetch.bind(globalThis),
@@ -310,12 +313,16 @@ export class LiveShowcase {
       headers: { "content-type": "application/json" },
       body: body == null ? undefined : JSON.stringify(body),
     });
-    const data = await response.json();
-    if (!response.ok)
+    if (!response.ok) {
+      if (method === "DELETE" && response.status === 404) return;
+      const data = await response.json().catch(() => null);
       throw new Error(
-        data.error || `Kafka request failed (${response.status}).`,
+        data?.error ||
+          data?.cleanup_error ||
+          `Kafka request failed (${response.status}).`,
       );
-    return data;
+    }
+    return response.json();
   }
   async start() {
     if (this.snapshot || this.busy || this.closed)
@@ -355,7 +362,10 @@ export class LiveShowcase {
         "Live session revision or transport changed unexpectedly.",
       );
     const before = this.snapshot;
-    const projector = new EventProjector(before);
+    if (this.#projectionFailed)
+      throw new Error("Restart the live session to recover its books.");
+    // Seed once. A display snapshot contains sampled history, not the raw series.
+    const projector = (this.#projector ??= new EventProjector(before));
     // Reconcile public price/size and print updates at their source timestamp.
     // HTTP delivery batches can contain a cancellation and a later replenishment
     // with zero net change, which would hide information available to L2.
@@ -374,22 +384,31 @@ export class LiveShowcase {
     };
     let previous = before;
     let groupStart = 0;
-    for (const [index, event] of reply.events.entries()) {
-      projector.apply(event);
-      const next = reply.events[index + 1];
-      if (
-        (trackQueue || entryObserver) &&
-        (next?.clock_ms ?? reply.clock_ms) !== event.clock_ms
-      ) {
-        const observation = projector.snapshot(event.clock_ms);
-        observe(
-          previous,
-          observation,
-          reply.events.slice(groupStart, index + 1),
-        );
-        previous = observation;
-        groupStart = index + 1;
+    let projected;
+    try {
+      for (const [index, event] of reply.events.entries()) {
+        projector.apply(event);
+        const next = reply.events[index + 1];
+        if (
+          (trackQueue || entryObserver) &&
+          (next?.clock_ms ?? reply.clock_ms) !== event.clock_ms
+        ) {
+          const observation = projector.snapshot(event.clock_ms);
+          observe(
+            previous,
+            observation,
+            reply.events.slice(groupStart, index + 1),
+          );
+          previous = observation;
+          groupStart = index + 1;
+        }
       }
+      projected = projector.snapshot(reply.clock_ms);
+    } catch (error) {
+      // This batch may have applied some events. Keep the last displayed book and
+      // refuse another command until the user opens a fresh session.
+      this.#projectionFailed = true;
+      throw error;
     }
     this.eventsProcessed += reply.events.length;
     this.brokerRecords += Number(reply.recent.at(-1)?.kafka?.records || 0);
@@ -398,7 +417,7 @@ export class LiveShowcase {
       reply.events.findLast((event) => event.market_path)?.market_path ??
       before.market_path;
     this.snapshot = {
-      ...projector.snapshot(reply.clock_ms),
+      ...projected,
       id: reply.id,
       revision: reply.revision,
       transport: reply.transport,
@@ -434,6 +453,8 @@ export class LiveShowcase {
   async tick(milliseconds = 100, { pauseAtMilestones = false } = {}) {
     if (this.busy || !this.snapshot || this.closed)
       throw new Error("Live run is unavailable or has a request in flight.");
+    if (this.#projectionFailed)
+      throw new Error("Restart the live session to recover its books.");
     this.busy = true;
     const events = [];
     const before = this.snapshot;

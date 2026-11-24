@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { LiveCarryPolicy, LiveShowcase } from "./live-showcase.mjs";
 import { MODEL_V2 } from "./finance.mjs";
 import { HedgePolicy, L2QueueEstimator } from "./hedge-policy.mjs";
+import { EventProjector } from "./browser-artifact.mjs";
 
 function snapshot(premium = 80_000) {
   return {
@@ -78,6 +79,76 @@ test("live demo rejects a local transport response instead of substituting a rep
   });
   await assert.rejects(run.start(), /No replay fallback/);
   assert.equal(run.eventsProcessed, 0);
+});
+
+test("closing an expired session allows a restart and still surfaces broker cleanup failures", async () => {
+  const replies = [
+    { status: 503, cleanup_error: "topic deletion timed out" },
+    { status: 404, error: "Session expired" },
+  ];
+  const run = new LiveShowcase({
+    fetchImpl: async (_url, { method }) => {
+      assert.equal(method, "DELETE");
+      const reply = replies.shift();
+      return { ok: false, status: reply.status, json: async () => reply };
+    },
+  });
+  run.snapshot = { id: 1 };
+  await assert.rejects(run.close(), /topic deletion timed out/);
+  assert.equal(run.closed, false);
+  await run.close();
+  assert.equal(run.closed, true);
+});
+
+test("a live feed retains unsampled history across HTTP revisions", () => {
+  const initial = {
+    ...snapshot(),
+    id: 12,
+    revision: 0,
+    transport: "kafka",
+    history: [],
+  };
+  initial.books = initial.books.map((book, index) => ({
+    ...book,
+    bids: [
+      {
+        ...level(book.bid_cents, 10),
+        queue: [{ id: String(index * 2 + 1), qty_atoms: "10" }],
+      },
+    ],
+    asks: [
+      {
+        ...level(book.ask_cents, 10),
+        queue: [{ id: String(index * 2 + 2), qty_atoms: "10" }],
+      },
+    ],
+  }));
+  const run = new LiveShowcase();
+  run.snapshot = initial;
+  const uninterrupted = new EventProjector(initial);
+  for (let revision = 1; revision <= 1003; revision += 1) {
+    const clock = revision * 1000;
+    const event = {
+      type: "tick",
+      clock_ms: clock,
+      elapsed_ms: clock,
+      rng: 1,
+      fair_cents: 10_000_100,
+      sample: true,
+    };
+    uninterrupted.apply(event);
+    run.accept({
+      id: initial.id,
+      revision,
+      transport: "kafka",
+      clock_ms: clock,
+      events: [event],
+      recent: [],
+      stage: "running",
+    });
+  }
+  assert.deepEqual(run.snapshot.history, uninterrupted.snapshot().history);
+  assert.equal(run.snapshot.history.length, 502);
 });
 
 function level(price, lots) {

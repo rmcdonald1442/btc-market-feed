@@ -24,6 +24,9 @@ use transport::KafkaRun;
 
 const KAFKA_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+const MAX_SESSIONS: usize = 16;
+const MAX_REPLAYS: usize = 8;
+const RUN_COUNTER_MASK: u64 = u16::MAX as u64;
 
 struct App {
     broker: Option<String>,
@@ -31,6 +34,21 @@ struct App {
     lifecycle: Mutex<()>,
     sessions: Mutex<BTreeMap<u64, Arc<Mutex<Run>>>>,
     replays: Mutex<BTreeMap<u64, Arc<Mutex<ReplayRun>>>>,
+}
+
+impl App {
+    fn allocate_run_id(&self) -> Result<u64, ApiError> {
+        self.next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                (id & RUN_COUNTER_MASK != RUN_COUNTER_MASK).then_some(id + 1)
+            })
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Run IDs exhausted. Restart the server.".into(),
+                )
+            })
+    }
 }
 
 struct ReplayRun {
@@ -50,16 +68,22 @@ struct Run {
     kafka: Option<KafkaRun>,
     fault: Option<String>,
     recent: VecDeque<Value>,
-    last_trace: Value,
     clock_ms: u64,
-    last_compact_reply: Option<Value>,
-    last_compact_from_revision: Option<u64>,
-    previous_sim: Option<(u64, Session)>,
-    previous_recent: Option<VecDeque<Value>>,
-    last_command_from_revision: Option<u64>,
-    last_command_fingerprint: Option<String>,
-    last_command_reply: Option<Value>,
+    previous: Option<PreviousSnapshot>,
+    last_command: Option<AcceptedCommand>,
     closed: bool,
+}
+
+struct PreviousSnapshot {
+    revision: u64,
+    sim: Session,
+    recent: VecDeque<Value>,
+}
+
+struct AcceptedCommand {
+    revision: u64,
+    fingerprint: String,
+    reply: Value,
 }
 
 impl Run {
@@ -84,7 +108,12 @@ impl Run {
         state["recent"] = json!(recent);
     }
 
-    async fn execute(&mut self, command: Command, events_only: bool, fingerprint: Option<String>) -> ApiResult {
+    async fn execute(
+        &mut self,
+        command: Command,
+        events_only: bool,
+        fingerprint: Option<String>,
+    ) -> ApiResult {
         let started = std::time::Instant::now();
         let events = self
             .sim
@@ -105,14 +134,12 @@ impl Run {
         let delivered = match delivered {
             Ok(delivered) => delivered,
             Err(error) => {
-                self.fault = Some(format!("{error} Reset this session to reconnect."));
-                return Err(ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    self.fault.clone().unwrap(),
-                ));
+                let fault = format!("{error} Reset this session to reconnect.");
+                self.fault = Some(fault.clone());
+                return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, fault));
             }
         };
-        let kafka_timings = serde_json::to_value(&delivered.timings).unwrap();
+        let kafka_timings = delivered.timings;
         let consumed = delivered.events;
         let delivery_ms = delivery_started.elapsed().as_secs_f64() * 1000.0;
         let market_records = consumed.iter().filter(|event| !event.is_private()).count();
@@ -124,9 +151,6 @@ impl Run {
         let trace = serde_json::to_value(&consumed)
             .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         let trace_ms = trace_started.elapsed().as_secs_f64() * 1000.0;
-        let checkpoint_started = std::time::Instant::now();
-        let previous_revision = events_only.then_some(self.revision);
-        let checkpoint_copy_ms = checkpoint_started.elapsed().as_secs_f64() * 1000.0;
         let apply_started = std::time::Instant::now();
         let mut candidate = self.sim.clone();
         if let Err(error) = candidate.apply(consumed) {
@@ -134,15 +158,14 @@ impl Run {
             return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, error));
         }
         let previous = std::mem::replace(&mut self.sim, candidate);
-        self.last_trace = trace;
         let apply_ms = apply_started.elapsed().as_secs_f64() * 1000.0;
-        if let Some(revision) = previous_revision {
-            self.previous_sim = Some((revision, previous));
-            self.previous_recent = Some(self.recent.clone());
-        } else {
-            self.previous_sim = None;
-            self.previous_recent = None;
-        }
+        let checkpoint_started = std::time::Instant::now();
+        self.previous = events_only.then(|| PreviousSnapshot {
+            revision: self.revision,
+            sim: previous,
+            recent: self.recent.clone(),
+        });
+        let checkpoint_copy_ms = checkpoint_started.elapsed().as_secs_f64() * 1000.0;
         self.revision += 1;
         self.clock_ms = clock_ms;
         if self.recent.len() == 20 {
@@ -156,10 +179,8 @@ impl Run {
                 "transport": if self.kafka.is_some() { "kafka" } else { "local" },
                 "topics": self.kafka.as_ref().map(|kafka| json!({"market": kafka.market_topic, "private": kafka.private_topic})),
                 "fault": self.fault,
-                "recent": self.recent,
                 "clock_ms": self.clock_ms,
                 "stage": if self.clock_ms >= 86_400_000 { "complete" } else { "running" },
-                "events": self.last_trace,
                 "events_only": true,
             })
         } else {
@@ -177,17 +198,13 @@ impl Run {
             "apply_ms":apply_ms,"snapshot_ms":snapshot_ms,"checkpoint_copy_ms":checkpoint_copy_ms,"kafka":kafka_timings,
             "server_ms":started.elapsed().as_secs_f64() * 1000.0,
         }));
-        if events_only {
-            state["recent"] = json!(self.recent);
-        } else {
-            state["recent"] = json!(self.recent);
-            state["events"] = self.last_trace.clone();
-        }
-        self.last_compact_from_revision = if events_only { Some(self.revision - 1) } else { None };
-        self.last_compact_reply = if events_only { Some(state.clone()) } else { None };
-        self.last_command_from_revision = Some(self.revision - 1);
-        self.last_command_fingerprint = fingerprint;
-        self.last_command_reply = Some(state.clone());
+        state["recent"] = json!(self.recent);
+        state["events"] = trace;
+        self.last_command = fingerprint.map(|fingerprint| AcceptedCommand {
+            revision: self.revision - 1,
+            fingerprint,
+            reply: state.clone(),
+        });
         Ok(json_response(state))
     }
 }
@@ -279,21 +296,13 @@ async fn config(State(app): State<Arc<App>>) -> Json<Value> {
     }))
 }
 
-async fn start(State(app): State<Arc<App>>, Json(input): Json<Start>) -> ApiResult {
-    let _lifecycle = app.lifecycle.lock().await;
-    if input.seed > MAX_SAFE_INTEGER {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "Seed is too large.".into(),
-        ));
-    }
-    let at_capacity = { app.sessions.lock().await.len() >= 16 };
-    if at_capacity {
-        evict_oldest_session(&app).await.map_err(|error| ApiError(StatusCode::SERVICE_UNAVAILABLE, error))?;
-    }
-    let id = app.next_id.fetch_add(1, Ordering::Relaxed);
-    let kafka = match input.transport {
-        Transport::Local => None,
+async fn create_transport(
+    app: &App,
+    transport: Transport,
+    id: u64,
+) -> Result<Option<KafkaRun>, ApiError> {
+    match transport {
+        Transport::Local => Ok(None),
         Transport::Kafka => {
             let broker = app.broker.as_deref().ok_or_else(|| {
                 ApiError(
@@ -301,19 +310,49 @@ async fn start(State(app): State<Arc<App>>, Json(input): Json<Start>) -> ApiResu
                     "Kafka is not configured.".into(),
                 )
             })?;
-            Some(
-                tokio::time::timeout(KAFKA_TIMEOUT, KafkaRun::new(broker, id))
-                    .await
-                    .map_err(|_| {
-                        ApiError(
-                            StatusCode::GATEWAY_TIMEOUT,
-                            "Kafka connection timed out.".into(),
-                        )
-                    })?
-                    .map_err(|error| ApiError(StatusCode::SERVICE_UNAVAILABLE, error))?,
-            )
+            KafkaRun::new(broker, id)
+                .await
+                .map(Some)
+                .map_err(|error| ApiError(StatusCode::SERVICE_UNAVAILABLE, error))
         }
-    };
+    }
+}
+
+fn background_task_error(error: tokio::task::JoinError) -> ApiError {
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Request failed: {error}"),
+    )
+}
+
+async fn cleanup_after_failed_start(kafka: Option<&KafkaRun>, mut error: ApiError) -> ApiError {
+    if let Some(kafka) = kafka
+        && let Err(cleanup) = kafka.cleanup_topics().await
+    {
+        error
+            .1
+            .push_str(&format!(" Candidate cleanup failed: {cleanup}"));
+    }
+    error
+}
+
+async fn start(State(app): State<Arc<App>>, Json(input): Json<Start>) -> ApiResult {
+    if input.seed > MAX_SAFE_INTEGER {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Seed is too large.".into(),
+        ));
+    }
+    // Own provisioning and cleanup even if the HTTP request is dropped.
+    tokio::spawn(start_session(app, input))
+        .await
+        .map_err(background_task_error)?
+}
+
+async fn start_session(app: Arc<App>, input: Start) -> ApiResult {
+    let _lifecycle = app.lifecycle.lock().await;
+    let id = app.allocate_run_id()?;
+    let kafka = create_transport(&app, input.transport, id).await?;
     let mut run = Run {
         id,
         revision: 0,
@@ -325,22 +364,21 @@ async fn start(State(app): State<Arc<App>>, Json(input): Json<Start>) -> ApiResu
         kafka,
         fault: None,
         recent: VecDeque::new(),
-        last_trace: json!([]),
         clock_ms: 0,
-        last_compact_reply: None,
-        last_compact_from_revision: None,
-        previous_sim: None,
-        previous_recent: None,
-        last_command_from_revision: None,
-        last_command_fingerprint: None,
-        last_command_reply: None,
+        previous: None,
+        last_command: None,
         closed: false,
     };
     if let Err(error) = run.execute(Command::Initialize, false, None).await {
-        if let Some(kafka) = &run.kafka {
-            let _ = kafka.cleanup_topics().await;
-        }
-        return Err(error);
+        return Err(cleanup_after_failed_start(run.kafka.as_ref(), error).await);
+    }
+    let at_capacity = app.sessions.lock().await.len() >= MAX_SESSIONS;
+    if at_capacity && let Err(error) = evict_oldest_session(&app).await {
+        return Err(cleanup_after_failed_start(
+            run.kafka.as_ref(),
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, error),
+        )
+        .await);
     }
     let state = run.snapshot();
     let mut sessions = app.sessions.lock().await;
@@ -366,13 +404,22 @@ async fn cleanup_run(run: Arc<Mutex<Run>>) -> Option<String> {
 }
 
 async fn evict_oldest_session(app: &App) -> Result<(), String> {
-    let (id, entry) = app.sessions.lock().await.first_key_value()
+    let (id, entry) = app
+        .sessions
+        .lock()
+        .await
+        .first_key_value()
         .map(|(id, run)| (*id, run.clone()))
         .ok_or_else(|| "Session capacity changed during eviction.".to_owned())?;
     entry.lock().await.closed = true;
-    if let Some(error) = cleanup_run(entry.clone()).await { return Err(error); }
+    if let Some(error) = cleanup_run(entry.clone()).await {
+        return Err(error);
+    }
     let mut sessions = app.sessions.lock().await;
-    if sessions.get(&id).is_some_and(|current| Arc::ptr_eq(current, &entry)) {
+    if sessions
+        .get(&id)
+        .is_some_and(|current| Arc::ptr_eq(current, &entry))
+    {
         sessions.remove(&id);
     }
     Ok(())
@@ -380,16 +427,31 @@ async fn evict_oldest_session(app: &App) -> Result<(), String> {
 
 async fn close_session(State(app): State<Arc<App>>, Path(id): Path<u64>) -> ApiResult {
     let _lifecycle = app.lifecycle.lock().await;
-    let run = app.sessions.lock().await.get(&id).cloned().ok_or_else(|| {
-        ApiError(StatusCode::NOT_FOUND, "Session expired.".into())
-    })?;
+    let run = app
+        .sessions
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Session expired.".into()))?;
     run.lock().await.closed = true;
     if let Some(error) = cleanup_run(run.clone()).await {
-        return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"closed":false,"id":id,"cleanup_error":error}))).into_response());
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"closed":false,"id":id,"cleanup_error":error})),
+        )
+            .into_response());
     }
     let mut sessions = app.sessions.lock().await;
-    if sessions.get(&id).is_some_and(|current| Arc::ptr_eq(current, &run)) { sessions.remove(&id); }
-    Ok(json_response(json!({"closed":true,"id":id,"cleanup_error":null})))
+    if sessions
+        .get(&id)
+        .is_some_and(|current| Arc::ptr_eq(current, &run))
+    {
+        sessions.remove(&id);
+    }
+    Ok(json_response(
+        json!({"closed":true,"id":id,"cleanup_error":null}),
+    ))
 }
 
 async fn cleanup_replay(run: Arc<Mutex<ReplayRun>>) -> Option<String> {
@@ -401,13 +463,22 @@ async fn cleanup_replay(run: Arc<Mutex<ReplayRun>>) -> Option<String> {
 }
 
 async fn evict_oldest_replay(app: &App) -> Result<(), String> {
-    let (id, entry) = app.replays.lock().await.first_key_value()
+    let (id, entry) = app
+        .replays
+        .lock()
+        .await
+        .first_key_value()
         .map(|(id, run)| (*id, run.clone()))
         .ok_or_else(|| "Replay capacity changed during eviction.".to_owned())?;
     entry.lock().await.closed = true;
-    if let Some(error) = cleanup_replay(entry.clone()).await { return Err(error); }
+    if let Some(error) = cleanup_replay(entry.clone()).await {
+        return Err(error);
+    }
     let mut replays = app.replays.lock().await;
-    if replays.get(&id).is_some_and(|current| Arc::ptr_eq(current, &entry)) {
+    if replays
+        .get(&id)
+        .is_some_and(|current| Arc::ptr_eq(current, &entry))
+    {
         replays.remove(&id);
     }
     Ok(())
@@ -415,16 +486,31 @@ async fn evict_oldest_replay(app: &App) -> Result<(), String> {
 
 async fn close_replay(State(app): State<Arc<App>>, Path(id): Path<u64>) -> ApiResult {
     let _lifecycle = app.lifecycle.lock().await;
-    let run = app.replays.lock().await.get(&id).cloned().ok_or_else(|| {
-        ApiError(StatusCode::NOT_FOUND, "Replay expired.".into())
-    })?;
+    let run = app
+        .replays
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Replay expired.".into()))?;
     run.lock().await.closed = true;
     if let Some(error) = cleanup_replay(run.clone()).await {
-        return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"closed":false,"id":id,"cleanup_error":error}))).into_response());
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"closed":false,"id":id,"cleanup_error":error})),
+        )
+            .into_response());
     }
     let mut replays = app.replays.lock().await;
-    if replays.get(&id).is_some_and(|current| Arc::ptr_eq(current, &run)) { replays.remove(&id); }
-    Ok(json_response(json!({"closed":true,"id":id,"cleanup_error":null})))
+    if replays
+        .get(&id)
+        .is_some_and(|current| Arc::ptr_eq(current, &run))
+    {
+        replays.remove(&id);
+    }
+    Ok(json_response(
+        json!({"closed":true,"id":id,"cleanup_error":null}),
+    ))
 }
 
 async fn current(
@@ -435,18 +521,21 @@ async fn current(
     let run = find(&app, id).await?;
     let run = run.lock().await;
     if run.closed {
-        return Err(ApiError(StatusCode::GONE, "Session is closing or closed.".into()));
+        return Err(ApiError(
+            StatusCode::GONE,
+            "Session is closing or closed.".into(),
+        ));
     }
     let requested_revision = query.revision.unwrap_or(run.revision);
     if requested_revision == run.revision {
         return Ok(json_response(run.snapshot()));
     }
-    if let (Some((previous_revision, previous_sim)), Some(previous_recent)) =
-        (&run.previous_sim, &run.previous_recent)
-        && requested_revision == *previous_revision {
-            let mut state = previous_sim.snapshot();
-            run.decorate_snapshot(&mut state, *previous_revision, previous_recent);
-            return Ok(json_response(state));
+    if let Some(previous) = &run.previous
+        && requested_revision == previous.revision
+    {
+        let mut state = previous.sim.snapshot();
+        run.decorate_snapshot(&mut state, previous.revision, &previous.recent);
+        return Ok(json_response(state));
     }
     Err(ApiError(
         StatusCode::CONFLICT,
@@ -467,18 +556,25 @@ async fn mutate(
     tokio::spawn(async move {
         let mut run = run.lock().await;
         if run.closed {
-            return Err(ApiError(StatusCode::GONE, "Session is closing or closed.".into()));
+            return Err(ApiError(
+                StatusCode::GONE,
+                "Session is closing or closed.".into(),
+            ));
         }
         if let Some(error) = &run.fault {
             return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, error.clone()));
         }
         if revision < run.revision {
-            if run.last_command_from_revision == Some(revision)
-                && run.last_command_fingerprint.as_deref() == Some(&fingerprint)
-                && let Some(reply) = &run.last_command_reply {
-                    return Ok(json_response(reply.clone()));
+            if let Some(accepted) = &run.last_command
+                && accepted.revision == revision
+                && accepted.fingerprint == fingerprint
+            {
+                return Ok(json_response(accepted.reply.clone()));
             }
-            return Err(ApiError(StatusCode::CONFLICT, "Revision is stale or was used by a different command.".into()));
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "Revision is stale or was used by a different command.".into(),
+            ));
         }
         if revision != run.revision {
             return Err(ApiError(
@@ -489,12 +585,7 @@ async fn mutate(
         run.execute(command, events_only, Some(fingerprint)).await
     })
     .await
-    .map_err(|error| {
-        ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Request failed: {error}"),
-        )
-    })?
+    .map_err(background_task_error)?
 }
 
 async fn step(
@@ -512,7 +603,15 @@ async fn step(
             ));
         }
     };
-    mutate(&app, id, input.revision, command, input.events_only, format!("step:{millis}:events_only={}", input.events_only)).await
+    mutate(
+        &app,
+        id,
+        input.revision,
+        command,
+        input.events_only,
+        format!("step:{millis}:events_only={}", input.events_only),
+    )
+    .await
 }
 
 async fn place(
@@ -530,7 +629,10 @@ async fn place(
             future_limit_cents: input.future_limit_cents,
         },
         false,
-        format!("place:{}:{}:{}", input.lots, input.spot_limit_cents, input.future_limit_cents),
+        format!(
+            "place:{}:{}:{}",
+            input.lots, input.spot_limit_cents, input.future_limit_cents
+        ),
     )
     .await
 }
@@ -540,13 +642,23 @@ async fn enter(
     Path(id): Path<u64>,
     Json(input): Json<Enter>,
 ) -> ApiResult {
-    let Place { revision, lots, spot_limit_cents, future_limit_cents } = input.pair;
+    let Place {
+        revision,
+        lots,
+        spot_limit_cents,
+        future_limit_cents,
+    } = input.pair;
     let cross_market = input.cross_market;
     mutate(
         &app,
         id,
         revision,
-        Command::Enter { lots, spot_limit_cents, future_limit_cents, cross_market },
+        Command::Enter {
+            lots,
+            spot_limit_cents,
+            future_limit_cents,
+            cross_market,
+        },
         false,
         format!("entry:{cross_market:?}:{lots}:{spot_limit_cents}:{future_limit_cents}"),
     )
@@ -558,7 +670,15 @@ async fn cancel(
     Path((id, order)): Path<(u64, u64)>,
     Json(input): Json<Revision>,
 ) -> ApiResult {
-    mutate(&app, id, input.revision, Command::Cancel(order), false, format!("cancel:{order}")).await
+    mutate(
+        &app,
+        id,
+        input.revision,
+        Command::Cancel(order),
+        false,
+        format!("cancel:{order}"),
+    )
+    .await
 }
 
 async fn cross(
@@ -566,7 +686,15 @@ async fn cross(
     Path((id, order)): Path<(u64, u64)>,
     Json(input): Json<Revision>,
 ) -> ApiResult {
-    mutate(&app, id, input.revision, Command::Cross(order), false, format!("cross:{order}")).await
+    mutate(
+        &app,
+        id,
+        input.revision,
+        Command::Cross(order),
+        false,
+        format!("cross:{order}"),
+    )
+    .await
 }
 
 async fn hedge(
@@ -574,7 +702,15 @@ async fn hedge(
     Path(id): Path<u64>,
     Json(input): Json<Revision>,
 ) -> ApiResult {
-    mutate(&app, id, input.revision, Command::Hedge, false, "hedge".into()).await
+    mutate(
+        &app,
+        id,
+        input.revision,
+        Command::Hedge,
+        false,
+        "hedge".into(),
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -589,34 +725,23 @@ struct ReplayBatch {
 }
 
 async fn replay_start(State(app): State<Arc<App>>, Json(input): Json<ReplayStart>) -> ApiResult {
+    tokio::spawn(start_replay(app, input))
+        .await
+        .map_err(background_task_error)?
+}
+
+async fn start_replay(app: Arc<App>, input: ReplayStart) -> ApiResult {
     let _lifecycle = app.lifecycle.lock().await;
-    let at_capacity = { app.replays.lock().await.len() >= 8 };
-    if at_capacity {
-        evict_oldest_replay(&app).await.map_err(|error| ApiError(StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let id = app.allocate_run_id()?;
+    let kafka = create_transport(&app, input.transport, id).await?;
+    let at_capacity = app.replays.lock().await.len() >= MAX_REPLAYS;
+    if at_capacity && let Err(error) = evict_oldest_replay(&app).await {
+        return Err(cleanup_after_failed_start(
+            kafka.as_ref(),
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, error),
+        )
+        .await);
     }
-    let id = app.next_id.fetch_add(1, Ordering::Relaxed);
-    let kafka = match input.transport {
-        Transport::Local => None,
-        Transport::Kafka => {
-            let broker = app.broker.as_deref().ok_or_else(|| {
-                ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Kafka is not configured.".into(),
-                )
-            })?;
-            Some(
-                tokio::time::timeout(KAFKA_TIMEOUT, KafkaRun::new(broker, id))
-                    .await
-                    .map_err(|_| {
-                        ApiError(
-                            StatusCode::GATEWAY_TIMEOUT,
-                            "Kafka connection timed out.".into(),
-                        )
-                    })?
-                    .map_err(|error| ApiError(StatusCode::SERVICE_UNAVAILABLE, error))?,
-            )
-        }
-    };
     let run = ReplayRun {
         kafka,
         revision: 0,
@@ -652,7 +777,10 @@ async fn replay_batch(
     tokio::spawn(async move {
         let mut run = run.lock().await;
         if run.closed {
-            return Err(ApiError(StatusCode::GONE, "Replay is closing or closed.".into()));
+            return Err(ApiError(
+                StatusCode::GONE,
+                "Replay is closing or closed.".into(),
+            ));
         }
         if let Some(fault) = &run.fault {
             return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, fault.clone()));
@@ -661,7 +789,10 @@ async fn replay_batch(
             if run.last_events.as_ref() == Some(&input.events) {
                 return Ok(json_response(run.last_reply.clone()));
             }
-            return Err(ApiError(StatusCode::CONFLICT, "Replay retry payload differs from the accepted batch.".into()));
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "Replay retry payload differs from the accepted batch.".into(),
+            ));
         }
         if input.revision != run.revision {
             return Err(ApiError(
@@ -733,7 +864,10 @@ fn web_file(path: &str) -> Response {
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     (
-        [(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "no-cache")],
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         body,
     )
         .into_response()
@@ -753,7 +887,10 @@ fn allowed_bind(bind: SocketAddr, container: bool) -> bool {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if arguments.first().is_some_and(|argument| argument == "--verify-day") {
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--verify-day")
+    {
         let mut kafka = false;
         let mut duration_ms = 86_400_000;
         let mut index = 1;
@@ -763,9 +900,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "--kafka" => kafka = true,
                 "--duration-seconds" => {
                     index += 1;
-                    let seconds: u64 = arguments.get(index).ok_or("Missing verification duration")?.parse()?;
+                    let seconds: u64 = arguments
+                        .get(index)
+                        .ok_or("Missing verification duration")?
+                        .parse()?;
                     if !(5..=86_400).contains(&seconds) {
-                        return Err("Verification duration must be between 5 and 86400 seconds".into());
+                        return Err(
+                            "Verification duration must be between 5 and 86400 seconds".into()
+                        );
                     }
                     duration_ms = seconds * 1000;
                 }
@@ -774,28 +916,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             index += 1;
         }
         let broker = if kafka {
-            Some(std::env::var("BASIS_KAFKA_BROKER").map_err(|_| "Set BASIS_KAFKA_BROKER for Kafka verification")?)
-        } else { None };
+            Some(
+                std::env::var("BASIS_KAFKA_BROKER")
+                    .map_err(|_| "Set BASIS_KAFKA_BROKER for Kafka verification")?,
+            )
+        } else {
+            None
+        };
         let stdout = std::io::stdout();
         let mut output = std::io::BufWriter::with_capacity(262_144, stdout.lock());
-        verify::run(&mut output, broker.as_deref(), duration_ms).await
+        verify::run(&mut output, broker.as_deref(), duration_ms)
+            .await
             .map_err(std::io::Error::other)?;
         std::io::Write::flush(&mut output)?;
         return Ok(());
     }
-    if !arguments.is_empty() { return Err("Unknown arguments; use --verify-day [--local|--kafka]".into()); }
+    if !arguments.is_empty() {
+        return Err("Unknown arguments; use --verify-day [--local|--kafka]".into());
+    }
     let bind: SocketAddr = std::env::var("BASIS_BIND")
         .unwrap_or_else(|_| "127.0.0.1:4330".into())
         .parse()?;
     let container_bind = std::env::var("BASIS_ALLOW_CONTAINER_BIND").as_deref() == Ok("1");
     if !allowed_bind(bind, container_bind) {
-        return Err("BASIS_BIND must be loopback, unless explicitly configured for a container bridge.".into());
+        return Err(
+            "BASIS_BIND must be loopback, unless explicitly configured for a container bridge."
+                .into(),
+        );
     }
     let app = Arc::new(App {
         broker: std::env::var("BASIS_KAFKA_BROKER")
             .ok()
             .filter(|value| !value.trim().is_empty()),
-        next_id: AtomicU64::new(1),
+        // Keep IDs numeric and sortable within a process without reusing the old server's IDs.
+        next_id: AtomicU64::new(rand::random::<u64>() & MAX_SAFE_INTEGER & !RUN_COUNTER_MASK),
         lifecycle: Mutex::new(()),
         sessions: Mutex::new(BTreeMap::new()),
         replays: Mutex::new(BTreeMap::new()),
@@ -834,8 +988,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::market::Message;
+    use super::*;
 
     #[test]
     fn public_bind_requires_the_explicit_container_wildcard() {
@@ -864,15 +1018,9 @@ mod tests {
             kafka: None,
             fault: None,
             recent: VecDeque::new(),
-            last_trace: json!([]),
             clock_ms: 0,
-            last_compact_reply: None,
-            last_compact_from_revision: None,
-            previous_sim: None,
-            previous_recent: None,
-            last_command_from_revision: None,
-            last_command_fingerprint: None,
-            last_command_reply: None,
+            previous: None,
+            last_command: None,
             closed: false,
         }
     }
@@ -888,20 +1036,100 @@ mod tests {
     async fn only_exact_latest_command_retry_uses_cached_reply() {
         let mut run = run(7);
         run.revision = 3;
-        run.last_command_from_revision = Some(2);
-        run.last_command_fingerprint = Some("step:100:events_only=true".into());
-        run.last_command_reply = Some(json!({"revision":3,"marker":"cached"}));
+        run.last_command = Some(AcceptedCommand {
+            revision: 2,
+            fingerprint: "step:100:events_only=true".into(),
+            reply: json!({"revision": 3, "marker": "cached"}),
+        });
         let app = app_with_session(7, run);
 
-        let exact = mutate(&app, 7, 2, Command::AdvanceMillis(100), true,
-            "step:100:events_only=true".into()).await;
+        let exact = mutate(
+            &app,
+            7,
+            2,
+            Command::AdvanceMillis(100),
+            true,
+            "step:100:events_only=true".into(),
+        )
+        .await;
         assert_eq!(status(exact), StatusCode::OK);
-        let changed = mutate(&app, 7, 2, Command::AdvanceMillis(101), true,
-            "step:101:events_only=true".into()).await;
+        let changed = mutate(
+            &app,
+            7,
+            2,
+            Command::AdvanceMillis(101),
+            true,
+            "step:101:events_only=true".into(),
+        )
+        .await;
         assert_eq!(status(changed), StatusCode::CONFLICT);
-        let older = mutate(&app, 7, 1, Command::AdvanceMillis(100), true,
-            "step:100:events_only=true".into()).await;
+        let older = mutate(
+            &app,
+            7,
+            1,
+            Command::AdvanceMillis(100),
+            true,
+            "step:100:events_only=true".into(),
+        )
+        .await;
         assert_eq!(status(older), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn failed_kafka_start_preserves_runs_at_capacity() {
+        let app = app_with_session(1, run(1));
+        for _ in 1..MAX_SESSIONS {
+            let candidate = Start {
+                seed: 73,
+                transport: Transport::Local,
+                scenario: Scenario::Reference,
+            };
+            assert_eq!(
+                status(start_session(app.clone(), candidate).await),
+                StatusCode::OK
+            );
+        }
+        for _ in 0..MAX_REPLAYS {
+            let candidate = ReplayStart {
+                transport: Transport::Local,
+            };
+            assert_eq!(
+                status(start_replay(app.clone(), candidate).await),
+                StatusCode::OK
+            );
+        }
+        let oldest_replay = *app.replays.lock().await.first_key_value().unwrap().0;
+
+        let session = Start {
+            seed: 73,
+            transport: Transport::Kafka,
+            scenario: Scenario::Reference,
+        };
+        assert_eq!(
+            status(start_session(app.clone(), session).await),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let replay = ReplayStart {
+            transport: Transport::Kafka,
+        };
+        assert_eq!(
+            status(start_replay(app.clone(), replay).await),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(app.sessions.lock().await.contains_key(&1));
+        assert!(app.replays.lock().await.contains_key(&oldest_replay));
+
+        let session = Start {
+            seed: 73,
+            transport: Transport::Local,
+            scenario: Scenario::Reference,
+        };
+        assert_eq!(
+            status(start_session(app.clone(), session).await),
+            StatusCode::OK
+        );
+        assert_eq!(app.sessions.lock().await.len(), MAX_SESSIONS);
+        assert!(!app.sessions.lock().await.contains_key(&1));
     }
 
     #[tokio::test]
@@ -909,27 +1137,50 @@ mod tests {
         let mut session = run(8);
         session.closed = true;
         let app = app_with_session(8, session);
-        let result = mutate(&app, 8, 0, Command::AdvanceMillis(1), false, "step:1:events_only=false".into()).await;
+        let result = mutate(
+            &app,
+            8,
+            0,
+            Command::AdvanceMillis(1),
+            false,
+            "step:1:events_only=false".into(),
+        )
+        .await;
         assert_eq!(status(result), StatusCode::GONE);
 
-        app.replays.lock().await.insert(9, Arc::new(Mutex::new(ReplayRun {
-            kafka: None,
-            revision: 0,
-            clock_ms: 0,
-            last_reply: json!(null),
-            fault: None,
-            last_events: None,
-            closed: true,
-        })));
+        app.replays.lock().await.insert(
+            9,
+            Arc::new(Mutex::new(ReplayRun {
+                kafka: None,
+                revision: 0,
+                clock_ms: 0,
+                last_reply: json!(null),
+                fault: None,
+                last_events: None,
+                closed: true,
+            })),
+        );
         let event = Event {
             clock_ms: 0,
-            message: Message::Tick { rng: 1, fair_cents: 1, basis_cents: 0,
-                sample: false, elapsed_ms: 0, next_event_ms: 1, market_path: None },
+            message: Message::Tick {
+                rng: 1,
+                fair_cents: 1,
+                basis_cents: 0,
+                sample: false,
+                elapsed_ms: 0,
+                next_event_ms: 1,
+                market_path: None,
+            },
         };
-        let result = replay_batch(State(app.clone()), Path(9), Json(ReplayBatch {
-            revision: 0,
-            events: vec![event],
-        })).await;
+        let result = replay_batch(
+            State(app.clone()),
+            Path(9),
+            Json(ReplayBatch {
+                revision: 0,
+                events: vec![event],
+            }),
+        )
+        .await;
         assert_eq!(status(result), StatusCode::GONE);
     }
 
@@ -947,8 +1198,15 @@ mod tests {
 
         let mutating_app = app.clone();
         let mutation = tokio::spawn(async move {
-            mutate(&mutating_app, 10, 0, Command::AdvanceMillis(1), false,
-                "step:1:events_only=false".into()).await
+            mutate(
+                &mutating_app,
+                10,
+                0,
+                Command::AdvanceMillis(1),
+                false,
+                "step:1:events_only=false".into(),
+            )
+            .await
         });
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
@@ -957,7 +1215,10 @@ mod tests {
         let close_status = status(close.await.expect("close task"));
         let mutation_status = status(mutation.await.expect("mutation task"));
         assert_eq!(close_status, StatusCode::OK);
-        assert!(matches!(mutation_status, StatusCode::GONE | StatusCode::NOT_FOUND));
+        assert!(matches!(
+            mutation_status,
+            StatusCode::GONE | StatusCode::NOT_FOUND
+        ));
         assert!(!app.sessions.lock().await.contains_key(&10));
     }
 }

@@ -782,7 +782,10 @@ async function restart() {
   clearTimeout(timer);
   controls();
   try {
-    if (inFlight) await inFlight.catch(() => {});
+    if (inFlight) {
+      await inFlight.catch(() => {});
+      clearTimeout(timer);
+    }
     if (run) await run.close();
     run = new LiveShowcase({
       mode: "l3",
@@ -965,14 +968,17 @@ $("comparisonForm").onsubmit = (event) => {
   );
 };
 $("policyComparison").addEventListener("close", () => comparison?.abort());
-window.addEventListener("pagehide", () => {
+window.addEventListener("pagehide", (event) => {
   comparison?.abort();
   playing = false;
   clearTimeout(timer);
-  if (run?.snapshot)
+  if (!event.persisted && run?.snapshot)
     void fetch(`/api/sessions/${run.snapshot.id}`, {
       method: "DELETE",
       keepalive: true,
     }).catch(() => {});
+});
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) void restart();
 });
 void restart();

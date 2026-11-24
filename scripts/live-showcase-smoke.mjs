@@ -10,11 +10,23 @@ const run = new LiveShowcase({
   scenario: "queue_demo",
 });
 const moments = [];
+let placement;
 try {
   await run.start();
   while (run.snapshot.clock_ms < 6500 && moments.length < 2) {
     const before = run.snapshot;
-    const { snapshot, events } = await run.tick();
+    const { snapshot, events, pauseReason } = await run.tick(100, {
+      pauseAtMilestones: true,
+    });
+    if (pauseReason === "placement") {
+      assert.equal(placement, undefined);
+      assert.equal(snapshot.clock_ms, before.clock_ms);
+      assert.deepEqual(
+        snapshot.orders.map(({ market, side }) => `${market}:${side}`).sort(),
+        ["future:sell", "spot:buy"],
+      );
+      placement = { clock_ms: snapshot.clock_ms };
+    }
     if (snapshot.clock_ms < 1100) continue;
     const step = moments.length === 0 ? "amend" : "fill";
     const moment = narratedBookChange(before, snapshot, events, step);
@@ -28,7 +40,18 @@ try {
   assert.ok(amendment.remaining_lots < amendment.previous_lots);
   assert.equal(fill.market, "future");
   assert.ok(fill.lots > 0 && fill.remaining_lots > 0);
-  console.log(JSON.stringify({ brokerRecords: run.brokerRecords, amendment, fill }));
+  assert.ok(
+    amendment.clock_ms < placement?.clock_ms &&
+      placement.clock_ms < fill.clock_ms,
+  );
+  console.log(
+    JSON.stringify({
+      brokerRecords: run.brokerRecords,
+      amendment,
+      placement,
+      fill,
+    }),
+  );
 } finally {
   await run.close();
 }
