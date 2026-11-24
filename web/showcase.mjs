@@ -673,14 +673,14 @@ async function pump() {
       : wallInterval(run.snapshot);
   const before = run.snapshot;
   inFlight = run.tick(STEP_MS, {
-    pauseAtMilestones: !feedPortfolio || manualFeed,
+    pauseAtMilestones: true,
   });
   controls();
   try {
     const result = await inFlight;
-    if (manualFeed && result.pauseReason === "placement") {
+    if (feedPortfolio && result.pauseReason === "placement") {
       pauseReason = "placement";
-      playing = false;
+      if (manualFeed) playing = false;
       render();
       return;
     }
@@ -701,7 +701,7 @@ async function pump() {
           "The selected market path did not contain both visible examples.",
         );
     }
-    if (result.pauseReason) {
+    if (!feedPortfolio && result.pauseReason) {
       pauseReason = result.pauseReason;
       if (!portfolio || result.pauseReason === "hedged") playing = false;
     }

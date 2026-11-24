@@ -8,11 +8,11 @@ Follow one resting order as a Kafka message changes its size. A later partial fi
 
 ![Live BTC spot and futures books showing an order amendment and a partial fill](docs/media/live-order-messages.gif)
 
-## Historical order book replay
+## Historical L3 archive
 
-A separate demo reconstructs historical L3 books from recorded order messages and replays them in the browser.
+A separate demo starts with one historical L3 book and expands to 30 books running together, with a live count of messages processed per second.
 
-![Historical L3 order book replay in the browser](docs/media/historical-l3-replay.gif)
+![Historical L3 archive showing one book followed by a 30-book benchmark](docs/media/historical-l3-archive.gif)
 
 ## Run the demo
 
@@ -20,7 +20,7 @@ A separate demo reconstructs historical L3 books from recorded order messages an
 docker compose up --build --wait
 ```
 
-Open [the feed walkthrough](http://127.0.0.1:4330/). In [manual mode](http://127.0.0.1:4330/?manual=1), use **Next** or the right arrow to step through the events. Open circles on the price chart mark order placement. Solid circles mark fills.
+Open [the automatic feed walkthrough](http://127.0.0.1:4330/). It pauses on the key scenes and advances on its own. In [manual mode](http://127.0.0.1:4330/?manual=1), use **Next** or the right arrow to step through the same scenes. Open circles on the price chart mark order placement. Solid circles mark fills.
 
 [The full demo](http://127.0.0.1:4330/?view=full) lets you compare entry and hedge rules using L3 order identities or L2 aggregate depth. Both modes use synthetic data and simulated executions.
 
